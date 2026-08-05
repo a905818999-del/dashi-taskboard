@@ -149,6 +149,12 @@ function aiChatThreadFromRow(row) {
       ...(row.origin_issue_identifier ? { issueIdentifier: row.origin_issue_identifier } : {}),
     },
     codexThreadId: row.codex_thread_id,
+    gitState: row.git_root ? {
+      root: row.git_root,
+      branch: row.git_branch,
+      head: row.git_head,
+      status: row.git_status ?? '',
+    } : null,
     model: row.model,
     reasoningEffort: row.reasoning_effort,
     sandbox: row.sandbox,
@@ -280,6 +286,10 @@ export class TaskboardDatabase {
         origin_issue_id TEXT,
         origin_issue_identifier TEXT,
         codex_thread_id TEXT,
+        git_root TEXT,
+        git_branch TEXT,
+        git_head TEXT,
+        git_status TEXT,
         model TEXT NOT NULL,
         reasoning_effort TEXT NOT NULL,
         sandbox TEXT NOT NULL CHECK (sandbox IN (
@@ -480,6 +490,26 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE attachments ADD COLUMN comment_id TEXT REFERENCES comments(id) ON DELETE CASCADE");
     }
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_created ON attachments(comment_id, created_at, id)");
+
+    const aiThreadColumns = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
+    for (const column of ['git_root', 'git_branch', 'git_head', 'git_status']) {
+      if (!aiThreadColumns.some((current) => current.name === column)) {
+        this.database.exec(`ALTER TABLE ai_chat_threads ADD COLUMN ${column} TEXT`);
+      }
+    }
+    this.database.exec(`
+      UPDATE ai_chat_threads
+      SET origin_issue_id = NULL
+      WHERE origin_issue_id IS NOT NULL
+        AND rowid NOT IN (
+          SELECT MAX(rowid) FROM ai_chat_threads
+          WHERE origin_issue_id IS NOT NULL
+          GROUP BY origin_issue_id
+        );
+      CREATE UNIQUE INDEX IF NOT EXISTS ai_chat_threads_one_issue
+        ON ai_chat_threads(origin_issue_id)
+        WHERE origin_issue_id IS NOT NULL;
+    `);
 
     const timestamp = now();
     this.database.prepare(`
@@ -689,6 +719,11 @@ export class TaskboardDatabase {
     return row ? this.#aiChatThreadWithCurrentRun(row) : null;
   }
 
+  getAiChatThreadForIssue(issueId) {
+    const row = this.database.prepare("SELECT * FROM ai_chat_threads WHERE origin_issue_id = ? LIMIT 1").get(issueId);
+    return row ? this.#aiChatThreadWithCurrentRun(row) : null;
+  }
+
   createAiChatThread(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.createdAt ?? now();
@@ -731,6 +766,10 @@ export class TaskboardDatabase {
       model: "model",
       reasoningEffort: "reasoning_effort",
       sandbox: "sandbox",
+      gitRoot: "git_root",
+      gitBranch: "git_branch",
+      gitHead: "git_head",
+      gitStatus: "git_status",
     };
     const assignments = [];
     const values = [];

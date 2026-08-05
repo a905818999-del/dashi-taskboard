@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
 
 const VISIBLE_TEXT_LIMIT = 65_536;
 const STDERR_LIMIT = 65_536;
@@ -13,6 +14,29 @@ const ITEM_TYPES = new Set([
   "error",
 ]);
 
+export function codexInvocation(executable, args = [], platform = process.platform) {
+  if (platform === "win32" && [".js", ".mjs", ".cjs"].includes(path.extname(executable).toLowerCase())) {
+    return { executable: process.execPath, args: [executable, ...args] };
+  }
+  return { executable, args };
+}
+export function codexSpawnOptions(executable, platform = process.platform) {
+  const isWindowsShim = platform === "win32" && [".cmd", ".bat"].includes(path.extname(executable).toLowerCase());
+  return { shell: isWindowsShim, windowsHide: true };
+}
+
+export function terminateProcessTree(child, platform = process.platform) {
+  if (!Number.isInteger(child?.pid)) return Promise.resolve();
+  if (platform === "win32") {
+    return new Promise((resolve) => {
+      const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      killer.once("error", () => { try { child.kill(); } catch {} resolve(); });
+      killer.once("close", resolve);
+    });
+  }
+  try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+  return Promise.resolve();
+}
 function cappedText(value) {
   return typeof value === "string" ? value.slice(0, VISIBLE_TEXT_LIMIT) : "";
 }
@@ -336,10 +360,12 @@ export function spawnCodexTurn({
   onRawEvent,
   maxLineBytes = 1_048_576,
 }) {
-  const child = spawn(executable, args, {
+  const invocation = codexInvocation(executable, args);
+  const child = spawn(invocation.executable, invocation.args, {
     detached: true,
     env,
     stdio: ["pipe", "pipe", "pipe"],
+    ...codexSpawnOptions(executable),
   });
 
   let stdoutBuffer = Buffer.alloc(0);
@@ -356,13 +382,7 @@ export function spawnCodexTurn({
   });
 
   function terminateProcessGroup() {
-    if (Number.isInteger(child.pid)) {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-        return;
-      } catch {}
-    }
-    child.kill("SIGKILL");
+    void terminateProcessTree(child);
   }
 
   function rejectWithDiagnostic(error) {

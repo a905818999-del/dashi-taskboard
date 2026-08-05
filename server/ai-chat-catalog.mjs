@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { ApiError } from "./database.mjs";
+import { codexInvocation, codexSpawnOptions, terminateProcessTree } from "./ai-chat-process.mjs";
 
 const execFileAsync = promisify(execFile);
 const CATALOG_TIMEOUT_MS = 10_000;
@@ -117,10 +118,12 @@ function sanitizeModels(value) {
 
 function listSkills(codexExecutable, workspacePath, processEnv) {
   return new Promise((resolve, reject) => {
-    const child = spawn(codexExecutable, ["app-server", "--stdio"], {
+    const invocation = codexInvocation(codexExecutable, ["app-server", "--stdio"]);
+    const child = spawn(invocation.executable, invocation.args, {
       cwd: workspacePath,
       env: processEnv,
       stdio: ["pipe", "pipe", "ignore"],
+      ...codexSpawnOptions(codexExecutable),
     });
     let buffer = "";
     let settled = false;
@@ -129,12 +132,12 @@ function listSkills(codexExecutable, workspacePath, processEnv) {
       CATALOG_TIMEOUT_MS,
     );
 
-    function finish(error, value) {
+    async function finish(error, value) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       child.stdin.end();
-      child.kill("SIGTERM");
+      await terminateProcessTree(child);
       if (error) reject(error);
       else resolve(value);
     }
@@ -220,8 +223,8 @@ function sanitizeSkills(entries) {
       unique.set(id, {
         id,
         label: displayName || id,
-        description: typeof skill.description === "string" ? skill.description.trim() : "",
-        path: typeof skill.path === "string" ? skill.path.trim() : "",
+        description: typeof skill.description === 'string' ? skill.description.trim() : '',
+        path: typeof skill.path === 'string' ? skill.path.trim() : '',
         scope: ["user", "repo", "system", "admin"].includes(skill.scope) ? skill.scope : "user",
       });
     }
@@ -237,13 +240,16 @@ export async function discoverAiCatalog({
   processEnv,
 }) {
   const { workspacePath } = await resolveAiWorkspace(projectId, codexStatePath, database);
+  const modelInvocation = codexInvocation(codexExecutable, ["debug", "models"]);
   const [modelResult, skillEntries] = await Promise.all([
-    execFileAsync(codexExecutable, ["debug", "models"], {
+    execFileAsync(modelInvocation.executable, modelInvocation.args, {
       cwd: workspacePath,
       env: processEnv,
       encoding: "utf8",
       timeout: CATALOG_TIMEOUT_MS,
       maxBuffer: CATALOG_MAX_BUFFER,
+      windowsHide: true,
+      shell: codexSpawnOptions(codexExecutable).shell,
     }),
     listSkills(codexExecutable, workspacePath, processEnv),
   ]);

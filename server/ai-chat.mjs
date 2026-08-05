@@ -4,11 +4,13 @@ import path from "node:path";
 
 import { ApiError } from "./database.mjs";
 import { discoverAiCatalog, resolveAiWorkspace } from "./ai-chat-catalog.mjs";
+import { acquireWorktreeGuard } from './worktree-guard.mjs';
 import {
   buildCodexArgs,
   buildCodexPrompt,
   normalizeCodexEvent,
   spawnCodexTurn,
+  terminateProcessTree,
 } from "./ai-chat-process.mjs";
 
 const SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]);
@@ -134,20 +136,30 @@ export class AiChatService {
           `Task '${input.issueId}' is not an active task in project '${input.projectId}'`,
         );
       }
+      const existing = this.database.getAiChatThreadForIssue(issue.id);
+      if (existing) return existing;
     }
 
-    return this.database.createAiChatThread({
-      title: input.title ?? issue?.identifier ?? "New conversation",
-      origin: {
-        projectId: resolved.project.id,
-        projectName: resolved.project.name,
-        workspacePath: resolved.workspacePath,
-        ...(issue ? { issueId: issue.id, issueIdentifier: issue.identifier } : {}),
-      },
-      model: model.slug,
-      reasoningEffort,
-      sandbox,
-    });
+    try {
+      return this.database.createAiChatThread({
+        title: input.title ?? issue?.identifier ?? "New conversation",
+        origin: {
+          projectId: resolved.project.id,
+          projectName: resolved.project.name,
+          workspacePath: issue?.developmentContext?.type === 'worktree'
+            ? issue.developmentContext.path
+            : resolved.workspacePath,
+          ...(issue ? { issueId: issue.id, issueIdentifier: issue.identifier } : {}),
+        },
+        model: model.slug,
+        reasoningEffort,
+        sandbox,
+      });
+    } catch (error) {
+      const existing = issue ? this.database.getAiChatThreadForIssue(issue.id) : null;
+      if (existing) return existing;
+      throw error;
+    }
   }
 
   async updateThread(threadId, changes) {
@@ -228,7 +240,11 @@ export class AiChatService {
     }
     const model = this.#resolveModel(catalog, thread.model);
     this.#validateReasoningEffort(model, thread.reasoningEffort);
-    if (resolved.workspacePath !== thread.origin.workspacePath) {
+    const issue = thread.origin.issueId ? this.database.getTask(thread.origin.issueId) : null;
+    const currentWorkspacePath = issue?.developmentContext?.type === 'worktree'
+      ? issue.developmentContext.path
+      : resolved.workspacePath;
+    if (currentWorkspacePath !== thread.origin.workspacePath) {
       throw new ApiError(
         409,
         "PROJECT_WORKSPACE_CHANGED",
@@ -250,6 +266,9 @@ export class AiChatService {
     const selectedSkills = skillIds.map((skillId) => availableSkills.get(skillId));
 
     const attachments = input.attachments ?? [];
+    const guard = thread.sandbox === 'read-only' || !thread.origin.issueId
+      ? null
+      : await acquireWorktreeGuard(thread.origin.workspacePath, thread.gitState);
     const {
       temporaryDirectory,
       attachmentPaths,
@@ -328,7 +347,7 @@ export class AiChatService {
         },
       });
 
-      const active = { child, threadId, interrupted: false, temporaryDirectory };
+      const active = { child, threadId, interrupted: false, temporaryDirectory, guard };
       this.active.set(run.id, active);
       const finalization = completion.then(
         (result) => this.#finishRun({
@@ -354,6 +373,7 @@ export class AiChatService {
       void finalization.finally(() => this.completions.delete(run.id)).catch(() => {});
       return run;
     } catch (error) {
+      if (guard) await guard.release();
       if (temporaryDirectory) {
         await rm(temporaryDirectory, { recursive: true, force: true });
       }
@@ -377,9 +397,10 @@ export class AiChatService {
     }
 
     active.interrupted = true;
-    signalProcessGroup(active.child, "SIGTERM");
+    if (process.platform === "win32") void terminateProcessTree(active.child);
+    else signalProcessGroup(active.child, "SIGTERM");
     const timer = setTimeout(() => {
-      if (this.active.has(runId)) signalProcessGroup(active.child, "SIGKILL");
+      if (this.active.has(runId)) void terminateProcessTree(active.child);
     }, this.killGraceMs);
     timer.unref();
 
@@ -394,7 +415,8 @@ export class AiChatService {
     const entries = [...this.active.entries()];
     for (const [, active] of entries) {
       active.interrupted = true;
-      signalProcessGroup(active.child, "SIGTERM");
+      if (process.platform === "win32") void terminateProcessTree(active.child);
+      else signalProcessGroup(active.child, "SIGTERM");
     }
 
     const completions = entries
@@ -404,7 +426,7 @@ export class AiChatService {
       const settled = Promise.allSettled(completions);
       await Promise.race([settled, wait(this.killGraceMs)]);
       for (const [runId, active] of entries) {
-        if (this.active.has(runId)) signalProcessGroup(active.child, "SIGKILL");
+        if (this.active.has(runId)) void terminateProcessTree(active.child);
       }
       await settled;
     }
@@ -568,6 +590,15 @@ export class AiChatService {
       return updated;
     } finally {
       this.active.delete(run.id);
+      if (active.guard) {
+        const gitState = await active.guard.release();
+        this.database.updateAiChatThread(run.threadId, {
+          gitRoot: gitState.root,
+          gitBranch: gitState.branch,
+          gitHead: gitState.head,
+          gitStatus: gitState.status,
+        });
+      }
       if (active.temporaryDirectory) {
         await rm(active.temporaryDirectory, { recursive: true, force: true });
       }

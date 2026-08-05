@@ -1730,6 +1730,12 @@ export function App() {
     }, "*");
   }
 
+  function openTaskAiChat(task: Task) {
+    window.dispatchEvent(new CustomEvent('taskboard:open-ai-chat', {
+      detail: { projectId: task.projectId, issueId: task.id },
+    }));
+  }
+
   function changeProject(projectId: string) {
     closeContextMenu();
     setProjectMenuOpen(false);
@@ -2192,7 +2198,7 @@ export function App() {
               mutateTaskRelation("remove", current, type, relatedTaskId)
             )}
             onOpenThread={openThread}
-            onOpenInThread={openTaskInThread}
+            onOpenInThread={openTaskAiChat}
             openingThread={openingThreadTaskId === detailTask.id}
             onError={setActionError}
             onAnnounce={setAnnouncement}

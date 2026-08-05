@@ -1,6 +1,6 @@
 # Codex Taskboard
 
-A local-first issue board that runs in a browser and can be embedded in Codex through the standalone CDP launcher or its injection script. The same HTTP API powers the React UI and the `taskctl` CLI used by the bundled Codex Skill.
+A local-first issue board that runs in a browser. On Windows, the supported primary mode is the standalone browser UI backed by the local Codex CLI; it does not inject into or modify Codex App data. The same HTTP API powers the React UI and the `taskctl` CLI used by the bundled Codex Skill.
 
 ## Requirements
 
@@ -15,6 +15,23 @@ npm start
 ```
 
 Open <http://127.0.0.1:47823>. The SQLite database is stored at `.data/taskboard.sqlite`.
+
+### Windows PowerShell
+
+```powershell
+npm ci
+npm run build
+npm start
+```
+
+Confirm Codex CLI discovery with `Get-Command codex -All`. If automatic discovery is ambiguous, set an explicit executable, including paths containing spaces or Chinese characters:
+
+```powershell
+$env:CODEX_EXECUTABLE = 'C:\Users\you\AppData\Roaming\npm\codex.cmd'
+npm start
+```
+
+Bind write-enabled tasks to a dedicated Git worktree. Before every task turn, Dashi verifies the branch, HEAD, dirty state and in-progress Git operations, then holds a single-run lock in that worktree. When switching between Codex App and Dashi, wait for the previous process tree to exit and the lock to be released; elapsed time alone is not a safety check. Browser conversations keep their Codex thread ID and remain resumable after refresh or service restart.
 
 For development with live frontend reload:
 
@@ -106,7 +123,7 @@ To use a different UI origin, set `window.__CODEX_TASKBOARD_URL__` before the us
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CODEX_TASKBOARD_HOST` | `0.0.0.0` | HTTP bind address; use `127.0.0.1` to disable LAN access |
+| `CODEX_TASKBOARD_HOST` | `127.0.0.1` | HTTP bind address; explicitly use `0.0.0.0` only for trusted unauthenticated LAN access |
 | `CODEX_TASKBOARD_PORT` | `47823` | Local HTTP port |
 | `CODEX_TASKBOARD_DATA_DIR` | `.data` | SQLite data directory |
 | `CODEX_TASKBOARD_URL` | `http://127.0.0.1:47823` | CLI API origin |
@@ -114,6 +131,10 @@ To use a different UI origin, set `window.__CODEX_TASKBOARD_URL__` before the us
 `npm start` prints both the local URL and the available LAN URLs. Teammates on the same trusted network can open one of those LAN URLs and use the same taskboard service. Task, comment, and attachment changes are broadcast to every open client through server-sent events; reconnecting clients perform a full refresh so changes made while disconnected are not missed. A teammate using `taskctl` can point it at the shared service with `CODEX_TASKBOARD_URL=http://<host-ip>:47823`.
 
 LAN mode has no account authentication: anyone on the trusted local network who can reach the URL can read and write the taskboard. Public internet and cloud deployment require an authenticated deployment boundary.
+
+## Source and distribution notice
+
+This fork is based on upstream commit `677b54451db707ae6132486b6593b7be11e4ee09`. The upstream repository has no recognizable project license. This Windows browser work is for development and self-testing in the GitHub fork; it does not add a license, publish binaries, or claim redistribution rights.
 
 ## Share through Cloudflare
 
