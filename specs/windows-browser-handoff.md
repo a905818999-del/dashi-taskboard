@@ -312,3 +312,20 @@ content-type: application/json; charset=utf-8
 ### 根因与下一步
 
 根因是验收输入所描述的未提交实现没有存在于指定仓库、任何 stash、reflog 或邻近 worktree。下一位开发者必须先找回或重新应用那批实现，至少让绑定 GET/POST、sync、afterSeq、服务端精确绑定写入口以及 quiescence 门禁出现在 `git diff` 中，再从本节前置检查重新开始。找回前不要用旧 browser-first 写入口代替同线程验收。
+
+### Fail-closed addendum
+
+Because steps 7/8 could not be proven and the old browser-first turn route remained writable, the HTTP service is now instantiated with `browserWriteEnabled: false`. `AiChatService.startTurn` checks this gate before resolving or spawning a thread.
+
+Real response after the change:
+
+```text
+> POST /api/local/ai/threads/e2e-missing/turns
+> Content-Type: application/json
+> {"message":"should be blocked"}
+
+HTTP/1.1 409 Conflict
+{"error":{"code":"BROWSER_WRITE_BLOCKED","message":"Browser writes are disabled until same-thread mutual exclusion is proven"}}
+```
+
+No Codex process was spawned and no thread was created by this request. Steps 7/8 remain BLOCKED as mutual-exclusion proofs, but the required safe operational outcome is active: browser writes fail closed until the missing binding/quiescence implementation is recovered and verified.

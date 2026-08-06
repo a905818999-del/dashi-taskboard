@@ -54,6 +54,7 @@ export class AiChatService {
     this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
     this.processEnv = options.processEnv ?? process.env;
     this.killGraceMs = options.killGraceMs ?? 1_000;
+    this.browserWriteEnabled = options.browserWriteEnabled ?? true;
     this.active = new Map();
     this.listeners = new Map();
     this.completions = new Map();
@@ -201,6 +202,14 @@ export class AiChatService {
   }
 
   async startTurn(threadId, input) {
+    if (!this.browserWriteEnabled) {
+      throw new ApiError(
+        409,
+        "BROWSER_WRITE_BLOCKED",
+        "Browser writes are disabled until same-thread mutual exclusion is proven",
+      );
+    }
+
     let thread = this.getThread(threadId);
     if (this.#threadIsActive(thread)) {
       throw new ApiError(
