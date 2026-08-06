@@ -236,3 +236,79 @@ The three failures match previously handed-off baseline contract gaps and are no
 3. UI test cannot import the pre-existing missing `insertSkillMention` export.
 
 No real Codex App ↔ browser round trip has passed. The feature remains incomplete.
+
+## 真实接力证据（2026-08-07，BLOCKED）
+
+本节记录真实机器上的验收尝试，不是完成功能声明。
+
+### 仓库状态核对
+
+```text
+git branch --show-current
+feat/windows-browser-mvp
+
+git rev-parse HEAD
+196515620b2208bdc0e39cbba353b7f51b208694
+
+git status --porcelain=v2 --untracked-files=all
+<empty>
+```
+
+用户交接声称未提交的以下实现文件和修改，在实际工作区中不存在：
+
+- `server/ai-chat-binding.mjs`
+- `server/codex-app-server.mjs`
+- `test/ai-chat-binding.test.mjs`
+- `task_codex_bindings`、`assertBrowserWriteAllowed`、`browserWriteEnabled`、绑定/同步 HTTP 路由
+
+进一步检查 `git stash list`、`git reflog`、`git worktree list` 以及整个 `dashi-taskboard-windows` 目录，也没有找到这些遗失改动。当前 HEAD 仍只有原始浏览器 AI MVP 和前一次交接文档/三项基础修正。
+
+### 前置命令与真实响应
+
+```text
+> codex --version
+codex-cli 0.128.0
+
+> node server/index.mjs
+Codex Taskboard listening on http://127.0.0.1:47823
+
+> curl.exe -sS -i http://127.0.0.1:47823/health
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+
+{"status":"ok"}
+
+> curl.exe -sS -i http://127.0.0.1:47823/api/tasks/e2e-missing/ai-binding
+HTTP/1.1 404 Not Found
+content-type: application/json; charset=utf-8
+
+{"error":{"code":"NOT_FOUND","message":"API route not found"}}
+```
+
+验收服务进程 PID `15808` 已在取证后停止，结果为 `SERVER_STOPPED`。
+
+### 阻塞判断
+
+第一个必需的绑定读取端点即返回 404，说明权威绑定/adopt/sync 实现没有进入当前工作树。此状态下继续创建 A1/T 并调用旧浏览器写入口，只会验证旧的 browser-first 路径，并存在创建平行 root thread 的风险；这违反本次验收的同线程约束。因此没有创建 T、没有运行 B1/A2，也没有修改 Codex App session/database 文件。
+
+没有真实 T，故无法提供伪造的 thread ID、事件列表、互斥证明或状态目录“只有 T”的证明。浏览器写入口的 App/CLI 互斥也无法进入验证阶段；本次结论是“无法证明”，但根因是验收所需实现完全缺失，而不是已实现门禁的锁语义失败。当前代码也不存在交接所述 `browserWriteEnabled` 配置面；按照“只做验收、不要重复实现”的约束，本次没有擅自重写功能。
+
+### 十步结果
+
+| 步骤 | 结果 | 真实证据/原因 |
+| --- | --- | --- |
+| 1. App 写 A1 并取得 T | BLOCKED | 绑定入口缺失；继续会冒险制造无法绑定的孤立 thread，故未创建 T |
+| 2. 浏览器 adopt T | BLOCKED | `GET .../ai-binding` 已返回 404；POST adopt 路由不存在 |
+| 3. 浏览器 B1 精确 resume T | BLOCKED | 无权威绑定和 adopt 结果，不能安全调用旧写入口 |
+| 4. App Server 读到 A1+B1 | BLOCKED | 无 T/B1 |
+| 5. App 对 T 写 A2 | BLOCKED | 无 T |
+| 6. afterSeq 只新增 A2 | BLOCKED | `ai-sync`/`afterSeq` 实现不在工作树 |
+| 7. App 活跃时浏览器 fail closed | BLOCKED | `assertBrowserWriteAllowed` 不在工作树，无法证明互斥 |
+| 8. 浏览器活跃时另一写入 fail closed | BLOCKED | 同上，无法证明互斥 |
+| 9. 全程 ID 一致 | BLOCKED | 未创建 T，不能声称一致 |
+| 10. 无平行 root thread | BLOCKED | 为避免污染未创建任何验收 thread；不能提供“只有 T”证据 |
+| 隐私复核 | BLOCKED | adopt/sync 事件响应不存在，无法对真实响应执行隐私断言 |
+
+### 根因与下一步
+
+根因是验收输入所描述的未提交实现没有存在于指定仓库、任何 stash、reflog 或邻近 worktree。下一位开发者必须先找回或重新应用那批实现，至少让绑定 GET/POST、sync、afterSeq、服务端精确绑定写入口以及 quiescence 门禁出现在 `git diff` 中，再从本节前置检查重新开始。找回前不要用旧 browser-first 写入口代替同线程验收。
