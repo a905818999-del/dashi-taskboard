@@ -503,7 +503,7 @@ function actorFromRequest(request) {
   const rawName = requestHeader(request, "x-taskboard-user-name");
   const rawAvatarUrl = requestHeader(request, "x-taskboard-user-avatar");
   if (rawId === undefined && rawName === undefined && rawAvatarUrl === undefined) {
-    return { type: "user", id: "local-user", name: "鏈湴鐢ㄦ埛", avatarUrl: null };
+    return { type: "user", id: "local-user", name: "本地用户", avatarUrl: null };
   }
   if (rawId === undefined || rawName === undefined) {
     throw new ApiError(400, "INVALID_ACTOR", "User identity requires both an ID and name");
@@ -824,6 +824,48 @@ function parseAiThreadPatch(body) {
     throw new ApiError(400, "INVALID_BODY", "PATCH requires at least one thread setting");
   }
   return input;
+}
+
+// Adopt body: the browser supplies the expected Codex thread id (from the App
+// deep link) and the workspace path. The server verifies the id via App Server
+// before committing — a client-supplied id never selects the resume target.
+function parseAiBindingAdopt(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "codexThreadId", "workspacePath", "source", "model", "reasoningEffort", "sandbox",
+  ]));
+  const codexThreadId = stringField(body.codexThreadId, "codexThreadId", {
+    required: true, maxLength: 256,
+  });
+  if (codexThreadId.includes("\0")) {
+    throw new ApiError(400, "INVALID_FIELD", "'codexThreadId' is invalid");
+  }
+  return {
+    codexThreadId,
+    workspacePath: body.workspacePath !== undefined
+      ? stringField(body.workspacePath, "workspacePath", { maxLength: 1024 })
+      : undefined,
+    source: body.source !== undefined
+      ? stringField(body.source, "source", { maxLength: 32 })
+      : undefined,
+    model: body.model !== undefined
+      ? stringField(body.model, "model", { maxLength: 128 })
+      : undefined,
+    reasoningEffort: body.reasoningEffort !== undefined
+      ? stringField(body.reasoningEffort, "reasoningEffort", { maxLength: 64 })
+      : undefined,
+    sandbox: body.sandbox !== undefined ? parseAiSandbox(body.sandbox) : undefined,
+  };
+}
+
+function parseAiBindingResolveConflict(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["action"]));
+  const action = stringField(body.action, "action", { required: true, maxLength: 32 });
+  if (action !== "keep_app" && action !== "promote_browser") {
+    throw new ApiError(400, "INVALID_FIELD", "'action' must be 'keep_app' or 'promote_browser'");
+  }
+  return { action };
 }
 
 function parseAiSkillIds(value) {
@@ -1331,7 +1373,10 @@ export function createTaskboardServer(options = {}) {
     codexExecutable: resolved.codexExecutable,
     codexStatePath: resolved.codexStatePath,
     manageTaskboardSkillPath: resolved.skillPath,
-    browserWriteEnabled: false,
+    // Fail-closed by default: browser turns stay blocked until same-thread
+    // mutual exclusion is proven against the real Codex App/CLI. Overridable
+    // only for test fixtures that drive a fake codex executable.
+    browserWriteEnabled: options.browserWriteEnabled ?? false,
   });
   const aiEventResponses = new Set();
 
@@ -1468,8 +1513,24 @@ export function createTaskboardServer(options = {}) {
       const aiThreadEventsRoute = pathname.match(/^\/api\/local\/ai\/threads\/([^/]+)\/events$/);
       if (aiThreadEventsRoute) {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
-        assertNoQuery(url.searchParams, "GET /api/local/ai/threads/:id/events");
+        assertAllowedQuery(url.searchParams, new Set(["afterSeq"]), "GET /api/local/ai/threads/:id/events");
         const threadId = decodeRouteSegment(aiThreadEventsRoute[1], "Thread id");
+        const afterSeqParam = url.searchParams.get("afterSeq");
+        if (afterSeqParam !== null) {
+          // JSON recovery endpoint: returns only events with seq > afterSeq.
+          // SSE is not authoritative for replay; clients always recover via
+          // this parameter after reconnect.
+          const afterSeq = Number.parseInt(afterSeqParam, 10);
+          if (!Number.isInteger(afterSeq) || afterSeq < 0) {
+            throw new ApiError(400, "INVALID_QUERY_PARAMETER", "afterSeq must be a non-negative integer");
+          }
+          const snapshot = await aiChat.getThreadSnapshot(threadId);
+          const events = snapshot.events.filter((event) => Number.isInteger(event.seq) && event.seq > afterSeq);
+          const maxSeq = events.length > 0
+            ? events.reduce((max, event) => Math.max(max, event.seq ?? 0), 0)
+            : afterSeq;
+          return sendJson(response, 200, { events, maxSeq });
+        }
         await aiChat.getThreadSnapshot(threadId);
         response.writeHead(200, {
           connection: "keep-alive",
@@ -2015,6 +2076,57 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { task });
         }
         return methodNotAllowed(response, action ? ["POST"] : ["GET", "PATCH"]);
+      }
+
+      // Authoritative Codex thread binding for a task. The browser adopts an
+      // exact App-owned thread id (verified server-side), incrementally syncs
+      // visible history, and resolves legacy/App conflicts explicitly.
+      const aiBindingRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/ai-binding$/);
+      if (aiBindingRoute) {
+        const taskId = decodeRouteSegment(aiBindingRoute[1], "Task id");
+        if (request.method === "GET") {
+          assertNoQuery(url.searchParams, "GET /api/tasks/:id/ai-binding");
+          return sendJson(response, 200, aiChat.getBindingState(taskId));
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST /api/tasks/:id/ai-binding/adopt");
+          // The bare /ai-binding POST maps to adopt for ergonomics; the
+          // explicit /adopt sub-route below is the canonical entry.
+          const result = await aiChat.adoptCodexThread(taskId, parseAiBindingAdopt(await readJson(request)));
+          return sendJson(response, 200, result);
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const aiBindingAdoptRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/ai-binding\/adopt$/);
+      if (aiBindingAdoptRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/ai-binding/adopt");
+        const taskId = decodeRouteSegment(aiBindingAdoptRoute[1], "Task id");
+        const result = await aiChat.adoptCodexThread(taskId, parseAiBindingAdopt(await readJson(request)));
+        return sendJson(response, 200, result);
+      }
+
+      const aiBindingResolveRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/ai-binding\/resolve-conflict$/);
+      if (aiBindingResolveRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/ai-binding/resolve-conflict");
+        const taskId = decodeRouteSegment(aiBindingResolveRoute[1], "Task id");
+        const result = await aiChat.resolveBindingConflict(
+          taskId,
+          parseAiBindingResolveConflict(await readJson(request)),
+        );
+        return sendJson(response, 200, result);
+      }
+
+      const aiSyncRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/ai-sync$/);
+      if (aiSyncRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/ai-sync");
+        const taskId = decodeRouteSegment(aiSyncRoute[1], "Task id");
+        await assertEmptyRequestBody(request, "POST /api/tasks/:id/ai-sync");
+        const result = await aiChat.syncCodexThread(taskId);
+        return sendJson(response, 200, result);
       }
 
       if (pathname.startsWith("/api/")) {

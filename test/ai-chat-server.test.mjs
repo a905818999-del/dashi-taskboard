@@ -45,6 +45,9 @@ if (args[0] === "debug") {
     codexExecutable,
     codexStatePath,
     skillPath: "/fixture/manage-taskboard/SKILL.md",
+    // Tests exercise the write path against a fake codex executable; the
+    // production wiring stays fail-closed (browserWriteEnabled: false).
+    browserWriteEnabled: true,
   });
   const address = await app.listen({ host, port: 0 });
   return {
