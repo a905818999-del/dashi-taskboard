@@ -118,7 +118,7 @@ function sanitizeModels(value) {
 
 function listSkills(codexExecutable, workspacePath, processEnv) {
   return new Promise((resolve, reject) => {
-    const invocation = codexInvocation(codexExecutable, ["app-server", "--stdio"]);
+    const invocation = codexInvocation(codexExecutable, ["app-server", "--listen", "stdio://"]);
     const child = spawn(invocation.executable, invocation.args, {
       cwd: workspacePath,
       env: processEnv,

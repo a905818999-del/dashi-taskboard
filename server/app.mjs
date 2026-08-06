@@ -1123,7 +1123,7 @@ async function scanDevelopmentContexts(workspacePath) {
 
 async function discoverSkills(codexExecutable, workspacePath) {
   const entries = await new Promise((resolve, reject) => {
-    const child = spawn(codexExecutable, ["app-server", "--stdio"], {
+    const child = spawn(codexExecutable, ["app-server", "--listen", "stdio://"], {
       cwd: workspacePath,
       stdio: ["pipe", "pipe", "ignore"],
     });

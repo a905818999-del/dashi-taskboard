@@ -1,5 +1,7 @@
 # Windows browser mode
 
+> Status: the original browser-first MVP below is implemented at `84c2827`, but shared Codex App/browser thread handoff is still under development. See [windows-browser-handoff.md](./windows-browser-handoff.md) for the authoritative plan, current progress, safety contract, and next-agent instructions.
+
 ## Supported flow
 
 1. Start the local service in PowerShell; it listens on `127.0.0.1` by default.
