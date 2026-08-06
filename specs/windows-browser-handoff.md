@@ -329,3 +329,45 @@ HTTP/1.1 409 Conflict
 ```
 
 No Codex process was spawned and no thread was created by this request. Steps 7/8 remain BLOCKED as mutual-exclusion proofs, but the required safe operational outcome is active: browser writes fail closed until the missing binding/quiescence implementation is recovered and verified.
+
+## Implementation recovered (commit `c5a200a`)
+
+The missing implementation referenced by the blocked acceptance run above has been recovered and landed on `feat/windows-browser-mvp` as commit `c5a200a`, layered on top of `0a85feb`. The binding GET/POST routes, sync, `afterSeq`, server-side authoritative binding, quiescence gate, and conflict handling now exist in `git diff` against the upstream baseline.
+
+### Landed surface
+
+| File | Role |
+|---|---|
+| `server/ai-chat-binding.mjs` | `adopt` / `sync` / `resolveConflict`; cross-client write quiescence gate (`assertBrowserWriteAllowed`); conflict detection; never falls back to a new thread |
+| `server/codex-app-server.mjs` | Short-lived App Server reader + visible-event normalizer (drops reasoning / system / developer / raw JSONL / full MCP args+results / full command output / full diff) |
+| `server/database.mjs` | `task_codex_bindings` + `ai_chat_sync_state` tables; `seq` / `source_key` / `content_hash` columns; `importAiChatEvents`; `afterSeq` listing |
+| `server/app.mjs` | `GET/POST /api/tasks/:id/ai-binding`, `POST .../adopt`, `POST .../resolve-conflict`, `POST .../ai-sync`; `afterSeq` on events; `browserWriteEnabled` overridable, defaults to `false` |
+| `server/ai-chat.mjs` | Integrates the binding service; retains the `0a85feb` top-of-`startTurn` fail-closed gate |
+| `test/ai-chat-binding.test.mjs` | 19 tests: normalizer, uniqueness, idempotent sync, conflict, fail-closed, afterSeq, binding state |
+
+### Fail-closed by design (BLOCKED conclusion preserved)
+
+Per the spec's blocking rule, when same-thread mutual exclusion against the real Codex App/CLI cannot be proven, browser writes stay disabled:
+
+- `createTaskboardServer` defaults `browserWriteEnabled: false` → every browser turn returns `409 BROWSER_WRITE_BLOCKED` at the top of `startTurn`, before resolving a thread or spawning a Codex process. No new thread is created.
+- `adopt` / `sync` / `afterSeq` / binding-state reads remain fully functional on the read-only import path (no Codex write).
+- When mutual exclusion becomes provable, set `browserWriteEnabled: true`; task-bound threads then pass through the full `assertBrowserWriteAllowed` gate (mutex + quiescence probe + worktree guard).
+
+`0a85feb` had corrupted the `actorFromRequest` fallback name (`"本地用户"` → `"鏈湴鐢ㄦ埛"`); `c5a200a` restores the correct UTF-8.
+
+### Automated verification (development sandbox)
+
+| Check | Result |
+|---|---|
+| `npm run typecheck` | pass |
+| `npm run build` | pass |
+| `node --check` on all 5 server files | pass |
+| `test/ai-chat-binding.test.mjs` (19) | 19/19 pass |
+| full suite | 370 tests, 351 pass, 19 fail |
+| regression vs baseline `1965156` | failing set byte-identical after stripping timings → zero new regressions |
+
+The 19 failures are the pre-existing baseline (including the 3 AI contract failures recorded in the handoff doc), not regressions from this work.
+
+### Real App↔browser acceptance: still BLOCKED
+
+The development sandbox has no `codex` CLI, so the 10-step real handoff cannot be executed here. The implementation and automated tests are ready; the 10-step acceptance must be re-run on a Windows host with a real Codex App/CLI, starting from the prerequisite checks in the "真实接力证据" section above. Browser writes remain disabled until that acceptance proves mutual exclusion.
