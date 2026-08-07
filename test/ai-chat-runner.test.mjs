@@ -227,14 +227,20 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
     assert.equal(snapshot.events.some((event) => event.content?.includes("SECRET REASONING")), false);
     assert.equal(snapshot.events.some((event) => event.content === "Visible answer"), true);
     assert.equal(snapshot.events.some((event) => event.type === "command_execution"), true);
+    // Privacy: raw command output (aggregated_output) must not be retained.
+    const commandEvent = snapshot.events.find((event) => event.type === "command_execution");
+    assert.equal(commandEvent.data.output, undefined);
+    assert.equal(commandEvent.data.aggregated_output, undefined);
     const serialized = JSON.stringify(snapshot);
     assert.equal(serialized.includes("HIDDEN_SENTINEL"), true);
     assert.equal(serialized.includes("<taskboard_context>"), false);
+    assert.equal(serialized.includes("\"ok\""), false);
     const persisted = JSON.stringify(
       fixture.database.database.prepare("SELECT * FROM ai_chat_events").all(),
     );
     assert.equal(persisted.includes("<taskboard_context>"), false);
     assert.equal(persisted.includes("SECRET REASONING"), false);
+    assert.equal(persisted.includes("\"ok\""), false);
   } finally {
     await fixture.close();
   }

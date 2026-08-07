@@ -82,7 +82,8 @@ function normalizedItem(rawType, item) {
 
   if (item.type === "command_execution") {
     const command = cappedText(item.command);
-    const output = cappedText(item.aggregated_output);
+    // Privacy: raw command output (aggregated_output/output) is never retained.
+    // Only the command, status, and exit code are visible.
     return {
       kind: "event",
       type: item.type,
@@ -91,17 +92,17 @@ function normalizedItem(rawType, item) {
       data: {
         ...baseData,
         command,
-        ...(output ? { output } : {}),
         ...(Number.isInteger(item.exit_code) ? { exitCode: item.exit_code } : {}),
       },
     };
   }
 
   if (item.type === "file_change") {
+    // Privacy: file changes keep only path and operation (kind). No diffs.
     const changes = Array.isArray(item.changes)
       ? item.changes.map((change) => ({
           path: cappedText(change?.path),
-          kind: cappedText(change?.kind),
+          kind: cappedText(change?.kind ?? change?.operation),
         })).filter((change) => change.path)
       : [];
     const content = cappedText(changes.map((change) => change.path).join("\n"));
@@ -112,8 +113,7 @@ function normalizedItem(rawType, item) {
       content,
       data: {
         ...baseData,
-        files: cappedText(changes.map((change) => change.path).join("\n")).split("\n").filter(Boolean),
-        ...(changes.length > 0 ? { detail: detailText(changes) } : {}),
+        files: changes,
       },
     };
   }
@@ -121,11 +121,8 @@ function normalizedItem(rawType, item) {
   if (item.type === "mcp_tool_call") {
     const server = cappedText(item.server);
     const tool = cappedText(item.tool);
-    const detail = detailText({
-      ...(item.arguments !== undefined ? { arguments: item.arguments } : {}),
-      ...(item.result !== undefined ? { result: item.result } : {}),
-      ...(item.error !== undefined ? { error: item.error } : {}),
-    });
+    // Privacy: full MCP arguments/results/errors are never retained. Only
+    // server, tool, and status are visible.
     return {
       kind: "event",
       type: item.type,
@@ -135,7 +132,6 @@ function normalizedItem(rawType, item) {
         ...baseData,
         ...(server ? { server } : {}),
         ...(tool ? { tool } : {}),
-        ...(detail && detail !== "{}" ? { detail } : {}),
       },
     };
   }

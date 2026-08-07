@@ -9,7 +9,9 @@ import { AiChatBindingService } from "../server/ai-chat-binding.mjs";
 import {
   normalizeAppServerTurnItem,
   normalizeAppServerThread,
+  readCodexThread,
 } from "../server/codex-app-server.mjs";
+import { normalizeCodexEvent } from "../server/ai-chat-process.mjs";
 
 async function createDatabase() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-binding-"));
@@ -82,10 +84,18 @@ test("normalizer keeps every approved visible type and drops reasoning/system/ra
   assert.equal(mcp.data.tool, "create_issue");
   assert.equal(mcp.data.arguments, undefined);
   assert.equal(mcp.data.result, undefined);
+  assert.equal(mcp.data.detail, undefined);
+  // Command execution must drop raw output, keeping only command/status/exitCode.
+  const cmd = normalized.find((n) => n.type === "commandExecution");
+  assert.equal(cmd.data.command, "npm test");
+  assert.equal(cmd.data.exitCode, 0);
+  assert.equal(cmd.data.output, undefined);
+  assert.equal(cmd.data.aggregatedOutput, undefined);
   // File change keeps only path + operation, no diff.
   const file = normalized.find((n) => n.type === "fileChange");
   assert.deepEqual(file.data.files, [{ path: "a.ts", kind: "modify" }]);
   assert.equal(file.data.diff, undefined);
+  assert.equal(file.data.detail, undefined);
   // Reasoning/system/developer/raw are all dropped.
   assert.equal(normalized.some((n) => n.type === "reasoning"), false);
   assert.equal(normalized.some((n) => /system|developer|raw/i.test(n.type)), false);
@@ -515,6 +525,95 @@ test("getBindingState reports unbound/active/conflict/legacy signals for the UI"
     const active = service.getBindingState(task.id);
     assert.equal(active.binding.state, "active");
     assert.equal(active.thread.codexThreadId, "T");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("CLI normalizer drops raw command output, MCP arguments/results, and file diffs (negative privacy)", () => {
+  // command_execution: aggregated_output must be dropped.
+  const cmd = normalizeCodexEvent({
+    type: "item.completed",
+    item: { type: "command_execution", id: "c1", command: "npm test", status: "completed", exit_code: 0, aggregated_output: "SECRET stdout" },
+  });
+  assert.equal(cmd.data.command, "npm test");
+  assert.equal(cmd.data.exitCode, 0);
+  assert.equal(cmd.data.output, undefined);
+  assert.equal(cmd.data.aggregated_output, undefined);
+  assert.equal(JSON.stringify(cmd).includes("SECRET stdout"), false);
+
+  // mcp_tool_call: arguments/result/error must be dropped; only server/tool/status remain.
+  const mcp = normalizeCodexEvent({
+    type: "item.completed",
+    item: { type: "mcp_tool_call", id: "m1", server: "github", tool: "create_issue", status: "completed", arguments: { secret: true }, result: { url: "secret" }, error: "boom" },
+  });
+  assert.equal(mcp.data.server, "github");
+  assert.equal(mcp.data.tool, "create_issue");
+  assert.equal(mcp.data.arguments, undefined);
+  assert.equal(mcp.data.result, undefined);
+  assert.equal(mcp.data.error, undefined);
+  assert.equal(mcp.data.detail, undefined);
+  assert.equal(JSON.stringify(mcp).includes("secret"), false);
+
+  // file_change: only path + kind, no diff content.
+  const file = normalizeCodexEvent({
+    type: "item.completed",
+    item: { type: "file_change", id: "f1", status: "completed", changes: [{ path: "a.ts", kind: "modify", diff: "SECRET DIFF" }] },
+  });
+  assert.deepEqual(file.data.files, [{ path: "a.ts", kind: "modify" }]);
+  assert.equal(file.data.detail, undefined);
+  assert.equal(file.data.diff, undefined);
+  assert.equal(JSON.stringify(file).includes("SECRET DIFF"), false);
+
+  // reasoning is dropped entirely.
+  const reasoning = normalizeCodexEvent({
+    type: "item.completed",
+    item: { type: "reasoning", id: "r1", text: "SECRET chain of thought" },
+  });
+  assert.equal(reasoning, null);
+});
+
+test("App Server reader fails closed on spawn EPERM without bypassing the lock", async () => {
+  // A non-existent executable with .mjs extension routes through node and
+  // yields ENOENT; to force EPERM we point at a path the OS refuses to spawn.
+  // On unix, a directory is not executable and spawn yields EACCES/EPERM-ish;
+  // we assert the reader rejects (fail-closed) and the error is descriptive.
+  await assert.rejects(
+    readCodexThread({
+      codexExecutable: "/dev/null",
+      codexThreadId: "T",
+      workspacePath: "/tmp",
+      processEnv: { ...process.env },
+      timeoutMs: 5_000,
+    }),
+    (error) => {
+      const message = error.message || "";
+      // Fail-closed: any spawn failure is surfaced, never swallowed, and the
+      // caller marks the binding unavailable. We do not bypass the OS lock.
+      return /spawn|EPERM|ENOENT|EACCES|exited|app-server/i.test(message);
+    },
+  );
+});
+
+test("adopt marks the binding unavailable and never falls back when the App Server reader fails", async () => {
+  const fixture = await createDatabase();
+  try {
+    const task = createTask(fixture.database);
+    const reader = async () => { throw new Error("Codex app-server spawn was denied by the OS (EPERM)"); };
+    const service = new AiChatBindingService({
+      database: fixture.database,
+      codexExecutable: "codex",
+      readThread: reader,
+    });
+    await assert.rejects(
+      service.adopt(task.id, { codexThreadId: "T" }),
+      (error) => error.code === "ADOPT_UNAVAILABLE" && /EPERM/.test(error.message),
+    );
+    // Binding is unavailable, not active; no fallback thread was created.
+    const binding = fixture.database.getTaskCodexBinding(task.id);
+    assert.equal(binding.state, "unavailable");
+    assert.match(binding.error, /EPERM/);
+    assert.equal(fixture.database.getAiChatThreadForIssue(task.id), null);
   } finally {
     await fixture.close();
   }

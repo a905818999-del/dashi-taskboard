@@ -30,6 +30,24 @@ function cap(value) {
   return typeof value === "string" ? value.slice(0, VISIBLE_TEXT_LIMIT) : "";
 }
 
+// Translate a spawn failure (EPERM/ENOENT/EACCES) into a clear, fail-closed
+// error. We never bypass the OS lock or modify Codex App storage; the caller
+// (binding service) marks the binding unavailable so the next adopt/sync fails
+// closed with a precise reason.
+function spawnError(error) {
+  if (!error) return new Error("Codex app-server failed to start");
+  if (error.code === "EPERM") {
+    return new Error("Codex app-server spawn was denied by the OS (EPERM); the Codex App may hold a lock or the executable is not executable in this context");
+  }
+  if (error.code === "ENOENT") {
+    return new Error("Codex app-server executable was not found (ENOENT)");
+  }
+  if (error.code === "EACCES") {
+    return new Error("Codex app-server spawn was denied by permissions (EACCES)");
+  }
+  return error;
+}
+
 function itemId(item) {
   return cap(item.id);
 }
@@ -90,7 +108,8 @@ export function normalizeAppServerTurnItem(item, context = {}) {
 
   if (type === "commandExecution") {
     const command = cap(item.command);
-    const output = cap(item.aggregatedOutput ?? item.output);
+    // Privacy: raw command output (aggregatedOutput/output) is never retained.
+    // Only the command, status, and exit code are visible.
     return {
       ...base,
       role: "activity",
@@ -99,7 +118,6 @@ export function normalizeAppServerTurnItem(item, context = {}) {
         status: statusOf(item, "completed"),
         ...(sourceItemId ? { itemId: sourceItemId } : {}),
         ...(command ? { command } : {}),
-        ...(output ? { output } : {}),
         ...(Number.isInteger(item.exitCode) ? { exitCode: item.exitCode } : {}),
       },
     };
@@ -281,8 +299,8 @@ export function readCodexThread({
         index = buffer.indexOf("\n");
       }
     });
-    child.stdin.on("error", (error) => finish(error));
-    child.once("error", (error) => finish(error));
+    child.stdin.on("error", (error) => finish(spawnError(error)));
+    child.once("error", (error) => finish(spawnError(error)));
     child.once("exit", (code, signal) => {
       if (!settled) {
         finish(new Error(`Codex app-server exited before reading the thread (${signal || code})`));
