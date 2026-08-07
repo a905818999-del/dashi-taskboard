@@ -371,3 +371,27 @@ The 19 failures are the pre-existing baseline (including the 3 AI contract failu
 ### Real App↔browser acceptance: still BLOCKED
 
 The development sandbox has no `codex` CLI, so the 10-step real handoff cannot be executed here. The implementation and automated tests are ready; the 10-step acceptance must be re-run on a Windows host with a real Codex App/CLI, starting from the prerequisite checks in the "真实接力证据" section above. Browser writes remain disabled until that acceptance proves mutual exclusion.
+
+## 真实接力复测（2026-08-07，`edf1160`）
+
+修复提交进入分支后，在真实 Windows 主机复测：
+
+- `test/ai-chat-binding.test.mjs`：19/19 PASS。
+- TypeScript 类型检查与五个服务端模块语法检查：PASS。
+- Codex CLI：`0.128.0`。
+- 临时单命令覆盖 `service_tier=fast` 后生成 T：`019fdc2b-e2c8-7bb1-86c4-6939ce2b22e0`；未修改用户配置。
+- A1：FAIL。CLI 报告 `gpt-5.6-sol` 需要更新版 Codex，turn.failed。
+- Adopt：BLOCKED。精确 adopt T 返回 409 `ADOPT_UNAVAILABLE` / `spawn EPERM`。
+- 失败状态安全：binding 保留精确 T，state=`unavailable`，thread=`null`，没有 fallback 浏览器线程。
+- Sync：404 `AI_CHAT_THREAD_NOT_FOUND`（adopt 未生成浏览器线程）。
+- B1：409 `BROWSER_WRITE_BLOCKED`，没有启动 Codex 写进程。
+- 互斥：无法证明，生产写入口继续禁用。
+- 完整十步：BLOCKED。
+
+隐私复核发现 FAIL：`normalizeAppServerTurnItem` 会把 `commandExecution.aggregatedOutput/output` 原样放入 `data.output`（最多 65,536 字符）。真实函数复现中 `SECRET_FULL_COMMAND_OUTPUT` 完整出现在规范化结果里，违反“不保存完整命令输出”的规则；现有 19 项测试反而断言保留 `output`，需要修正实现和测试。
+
+GitHub fork 已关闭 Issues，因此无法在 `a905818999-del/dashi-taskboard` 创建 issue。复测结果已通知下一位开发者：
+
+- PR 评论：https://github.com/a905818999-del/dashi-taskboard/pull/1#issuecomment-5217059221
+
+尝试向不同的上游仓库创建 issue 被安全策略阻止，未绕过。若需正式 issue，仓库所有者应开启 fork 的 Issues，或明确授权将 fork 测试结果发送到指定上游仓库。
