@@ -595,6 +595,33 @@ test("App Server reader fails closed on spawn EPERM without bypassing the lock",
   );
 });
 
+test("App Server reader fails closed when spawn throws synchronously (Windows EPERM path)", async () => {
+  // On Windows, spawn() can throw EPERM synchronously before a child object
+  // exists (Codex App holds a lock). Reproduce the synchronous-throw path
+  // locally: an empty executable string makes spawn() throw
+  // ERR_INVALID_ARG_VALUE synchronously, before any child/error handler can
+  // attach. The try/catch around spawn must translate it via spawnError and
+  // reject — never swallow, never bypass.
+  await assert.rejects(
+    readCodexThread({
+      codexExecutable: "",
+      codexThreadId: "T",
+      workspacePath: "/tmp",
+      processEnv: { ...process.env },
+      timeoutMs: 5_000,
+    }),
+    (error) => {
+      // Synchronous spawn failure surfaced through spawnError. The error is
+      // a translated Error (not a raw EPERM object) and carries a clear,
+      // fail-closed message rather than a bare Node code.
+      const message = error.message || "";
+      return error.code !== "EPERM"
+        && error.code !== "ENOENT"
+        && /app-server|spawn|start/i.test(message);
+    },
+  );
+});
+
 test("adopt marks the binding unavailable and never falls back when the App Server reader fails", async () => {
   const fixture = await createDatabase();
   try {

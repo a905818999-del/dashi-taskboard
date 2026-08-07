@@ -30,10 +30,11 @@ function cap(value) {
   return typeof value === "string" ? value.slice(0, VISIBLE_TEXT_LIMIT) : "";
 }
 
-// Translate a spawn failure (EPERM/ENOENT/EACCES) into a clear, fail-closed
-// error. We never bypass the OS lock or modify Codex App storage; the caller
-// (binding service) marks the binding unavailable so the next adopt/sync fails
-// closed with a precise reason.
+// Translate a spawn failure (EPERM/ENOENT/EACCES or a synchronous throw like
+// ERR_INVALID_ARG_VALUE) into a clear, fail-closed error. We never bypass the
+// OS lock or modify Codex App storage; the caller (binding service) marks the
+// binding unavailable so the next adopt/sync fails closed with a precise
+// reason.
 function spawnError(error) {
   if (!error) return new Error("Codex app-server failed to start");
   if (error.code === "EPERM") {
@@ -45,7 +46,11 @@ function spawnError(error) {
   if (error.code === "EACCES") {
     return new Error("Codex app-server spawn was denied by permissions (EACCES)");
   }
-  return error;
+  // Synchronous argument/permission failures (e.g. Windows EPERM surfaced as
+  // ERR_INVALID_ARG_VALUE, or empty executable). Wrap so callers always see a
+  // consistent, fail-closed message instead of a bare Node code.
+  const detail = error.message ? `: ${String(error.message).slice(0, VISIBLE_TEXT_LIMIT)}` : "";
+  return new Error(`Codex app-server failed to start${detail}`);
 }
 
 function itemId(item) {
@@ -221,12 +226,23 @@ export function readCodexThread({
   }
   return new Promise((resolve, reject) => {
     const invocation = codexInvocation(codexExecutable, ["app-server", "--listen", "stdio://"]);
-    const child = spawn(invocation.executable, invocation.args, {
-      cwd: workspacePath,
-      env: processEnv,
-      stdio: ["pipe", "pipe", "ignore"],
-      ...codexSpawnOptions(codexExecutable),
-    });
+    let child;
+    // spawn() can throw synchronously (e.g. Windows EPERM when the Codex App
+    // holds a lock, or ENOENT/EACCES) before a child object exists, so the
+    // per-child error handlers below would never run. Catch the synchronous
+    // throw and fail closed with a precise reason. We never bypass the OS
+    // lock or modify Codex App storage.
+    try {
+      child = spawn(invocation.executable, invocation.args, {
+        cwd: workspacePath,
+        env: processEnv,
+        stdio: ["pipe", "pipe", "ignore"],
+        ...codexSpawnOptions(codexExecutable),
+      });
+    } catch (error) {
+      reject(spawnError(error));
+      return;
+    }
 
     let buffer = "";
     let totalBytes = 0;
