@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, chmod } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -11,7 +11,7 @@ import {
   normalizeAppServerThread,
   readCodexThread,
 } from "../server/codex-app-server.mjs";
-import { normalizeCodexEvent, resolveCodexExecutable, codexInvocation, codexSpawnOptions } from "../server/ai-chat-process.mjs";
+import { normalizeCodexEvent, resolveCodexExecutable, resolveCodexExecutableCandidates, codexInvocation, codexSpawnOptions } from "../server/ai-chat-process.mjs";
 
 async function createDatabase() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-binding-"));
@@ -748,4 +748,163 @@ test("normalizeAppServerThread prefers the wrapper thread over the flat fields w
   }, "WRAPPED");
   assert.equal(result.threadId, "WRAPPED");
   assert.equal(result.events[0].content, "wrapped");
+});
+
+test("resolveCodexExecutableCandidates: WindowsApps codex.exe is ordered AFTER npm codex.cmd so spawn can fall back on EPERM", () => {
+  // Real-world Windows layout: `where codex.exe` returns the MSIX WindowsApps
+  // binary (exists on PATH but throws synchronous EPERM under Node spawn),
+  // while `codex.cmd` (the npm shim) is the actually-spawnable entry.
+  // Existence is NOT proof of spawnability; the resolver must order candidates
+  // so a synchronous EPERM on the MSIX .exe lets the caller fall back to .cmd.
+  const whichAll = (name) => {
+    if (name === "codex.exe") return ["C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.803.5235.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe"];
+    if (name === "codex.cmd") return ["C:\\Users\\qz\\AppData\\Roaming\\npm\\codex.cmd"];
+    return [];
+  };
+  const candidates = resolveCodexExecutableCandidates("codex", { platform: "win32", whichAll });
+  // npm .cmd is preferred over the MSIX WindowsApps .exe (which EPERMs).
+  assert.equal(candidates[0], "C:\\Users\\qz\\AppData\\Roaming\\npm\\codex.cmd");
+  assert.equal(candidates[1], "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.803.5235.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe");
+});
+
+test("resolveCodexExecutableCandidates: a non-WindowsApps codex.exe is preferred first (shell:false, no injection)", () => {
+  const whichAll = (name) => {
+    if (name === "codex.exe") return ["C:\\npm\\codex.exe", "C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe"];
+    if (name === "codex.cmd") return ["C:\\Users\\qz\\AppData\\Roaming\\npm\\codex.cmd"];
+    return [];
+  };
+  const candidates = resolveCodexExecutableCandidates("codex", { platform: "win32", whichAll });
+  assert.deepEqual(candidates, [
+    "C:\\npm\\codex.exe",
+    "C:\\Users\\qz\\AppData\\Roaming\\npm\\codex.cmd",
+    "C:\\Program Files\\WindowsApps\\OpenAI.Codex\\codex.exe",
+  ]);
+});
+
+test("resolveCodexExecutableCandidates: returns the bare name unchanged when nothing is found (fail-closed via spawn)", () => {
+  const whichAll = () => [];
+  assert.deepEqual(resolveCodexExecutableCandidates("codex", { platform: "win32", whichAll }), ["codex"]);
+});
+
+test("resolveCodexExecutableCandidates: non-Windows and already-qualified paths are single-element lists", () => {
+  const boom = () => { throw new Error("whichAll must not be called"); };
+  assert.deepEqual(resolveCodexExecutableCandidates("codex", { platform: "linux", whichAll: boom }), ["codex"]);
+  assert.deepEqual(resolveCodexExecutableCandidates("C:\\App\\codex.exe", { platform: "win32", whichAll: boom }), ["C:\\App\\codex.exe"]);
+});
+
+test("normalizer extracts userMessage content from the real App Server array shape {content:[{type:'text',text}]}", () => {
+  // The real Codex App Server returns userMessage items as { id, content } where
+  // content is a list of user inputs (text/image/localImage). The previous
+  // normalizer only read item.text/item.message and projected empty content.
+  const normalized = normalizeAppServerTurnItem(
+    { type: "userMessage", id: "item-1", content: [{ type: "text", text: "A1 real content" }] },
+    { turnId: "t1", sourceOrder: 0 },
+  );
+  assert.equal(normalized.role, "user");
+  assert.equal(normalized.content, "A1 real content");
+  assert.equal(normalized.data.itemId, "item-1");
+  assert.equal(normalized.sourceKey, "t1:item-1");
+});
+
+test("normalizer joins multiple text parts in a userMessage content array and skips non-text parts", () => {
+  const normalized = normalizeAppServerTurnItem(
+    {
+      type: "userMessage",
+      id: "item-2",
+      content: [
+        { type: "text", text: "first line" },
+        { type: "image", url: "file:///secret.png" },
+        { type: "text", text: "second line" },
+      ],
+    },
+    { turnId: "t2", sourceOrder: 1 },
+  );
+  // Image parts carry no visible text and are skipped; text parts are joined.
+  assert.equal(normalized.content, "first line\nsecond line");
+  // No image URL / payload leaks into the visible projection.
+  assert.equal(JSON.stringify(normalized).includes("secret.png"), false);
+});
+
+test("normalizer still accepts the flat userMessage.text / agentMessage.text shapes (backward compat)", () => {
+  const user = normalizeAppServerTurnItem(
+    { type: "userMessage", id: "u1", text: "flat user" },
+    { turnId: "t1", sourceOrder: 0 },
+  );
+  assert.equal(user.content, "flat user");
+  const agent = normalizeAppServerTurnItem(
+    { type: "agentMessage", id: "a1", text: "flat agent" },
+    { turnId: "t1", sourceOrder: 1 },
+  );
+  assert.equal(agent.content, "flat agent");
+  // A plain-string content field is also accepted.
+  const str = normalizeAppServerTurnItem(
+    { type: "userMessage", id: "u2", content: "string content" },
+    { turnId: "t1", sourceOrder: 2 },
+  );
+  assert.equal(str.content, "string content");
+});
+
+test("readCodexThread falls back to the next candidate when the first spawn throws synchronously (WindowsApps EPERM path)", async () => {
+  // Reproduce the real Windows failure: the first candidate (MSIX codex.exe)
+  // throws a synchronous EPERM/ERR_INVALID_ARG_VALUE before a child object
+  // exists, while the next candidate (npm codex, simulated by a Node script)
+  // actually starts and answers the protocol. The fallback happens BEFORE any
+  // protocol/session write (no initialize/thread/read sent to the failed
+  // candidate), so no Codex App state is touched.
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-fallback-"));
+  try {
+    const fakeScript = path.join(directory, "fake-codex.mjs");
+    await writeFile(fakeScript, `#!/usr/bin/env node
+import { stdin, stdout } from "node:process";
+stdin.setEncoding("utf8");
+let buffer = "";
+stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let idx;
+  while ((idx = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.id === 1) stdout.write(JSON.stringify({ id: 1, result: {} }) + "\\n");
+    if (msg.id === 2) stdout.write(JSON.stringify({
+      id: 2,
+      result: {
+        thread: {
+          id: "T",
+          turns: [{ id: "t1", items: [
+            { type: "userMessage", id: "item-1", content: [{ type: "text", text: "A1 real content" }] },
+          ] }],
+        },
+      },
+    }) + "\\n");
+  }
+});
+`);
+    await chmod(fakeScript, 0o755);
+    // whichAll returns "" (synchronous spawn throw, simulating MSIX EPERM) as
+    // the first codex.exe hit, then the working Node script as a second hit.
+    // The resolver orders non-WindowsApps .exe first; "" has no WindowsApps in
+    // its path so it is tried first and fails, then fakeScript is tried.
+    const whichAll = (name) => {
+      if (name === "codex.exe") return ["", fakeScript];
+      return [];
+    };
+    const result = await readCodexThread({
+      codexExecutable: "codex",
+      codexThreadId: "T",
+      workspacePath: directory,
+      processEnv: { ...process.env },
+      timeoutMs: 8_000,
+      platform: "win32",
+      whichAll,
+    });
+    assert.equal(result.threadId, "T");
+    assert.equal(result.events.length, 1);
+    assert.equal(result.events[0].type, "userMessage");
+    assert.equal(result.events[0].content, "A1 real content");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

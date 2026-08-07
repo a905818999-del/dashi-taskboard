@@ -36,6 +36,30 @@ function defaultWhich(name) {
   return null;
 }
 
+// Scan PATH and return EVERY existing file match (not just the first). Needed
+// on Windows because `codex.exe` may exist in multiple PATH entries (e.g. an
+// MSIX `WindowsApps` install that throws synchronous EPERM under Node spawn,
+// alongside an npm `codex.cmd` that actually works). Returning all hits lets
+// the caller order candidates by spawnability and fall back on EPERM. Tests
+// inject `whichAll` to avoid filesystem/PATH dependence.
+function defaultWhichAll(name) {
+  if (typeof name !== "string" || name.length === 0) return [];
+  if (path.isAbsolute(name)) {
+    try { return existsSync(name) && statSync(name).isFile() ? [name] : []; } catch { return []; }
+  }
+  const pathEnv = process.env.PATH || "";
+  const sep = process.platform === "win32" ? ";" : ":";
+  const hits = [];
+  for (const dir of pathEnv.split(sep)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      if (existsSync(candidate) && statSync(candidate).isFile()) hits.push(candidate);
+    } catch {}
+  }
+  return hits;
+}
+
 // Resolve a bare Codex executable name on Windows to a concrete, spawnable
 // path. Node's spawn(shell:false) with a bare "codex" can hit the extensionless
 // npm Unix shim that npm installs alongside codex.cmd, which then fails with
@@ -45,6 +69,10 @@ function defaultWhich(name) {
 // platforms and already-qualified paths (with .exe/.cmd/.bat/.ps1) are returned
 // unchanged; if nothing is found, the bare name is returned so spawn() fails
 // closed through spawnError. `which` is injectable for cross-platform tests.
+//
+// Returns only the FIRST hit (for callers like the catalog that do not need
+// spawn-time fallback). readCodexThread uses resolveCodexExecutableCandidates
+// instead so it can fall back to the next candidate on a synchronous EPERM.
 export function resolveCodexExecutable(executable, options = {}) {
   const platform = options.platform ?? process.platform;
   if (platform !== "win32") return executable;
@@ -57,6 +85,48 @@ export function resolveCodexExecutable(executable, options = {}) {
     if (found) return found;
   }
   return executable;
+}
+
+// Resolve a bare Codex executable name on Windows to an ORDERED list of
+// spawnable candidate paths. Existence on PATH is NOT proof Node can spawn a
+// candidate: MSIX `WindowsApps\codex.exe` exists but throws synchronous EPERM
+// under Node spawn(shell:false). We therefore return all hits ordered so the
+// caller can try each in turn and fall back to the next on a synchronous spawn
+// failure, BEFORE any protocol/session write occurs.
+//
+// Ordering (most preferred first):
+//   1. Non-WindowsApps `codex.exe` — shell:false, no injection surface.
+//   2. `codex.cmd` (npm shim) — shell:true, but args are hardcoded constants
+//      (no user-influenced value reaches the shell), so the injection surface
+//      does not materialize for our fixed `app-server --listen stdio://` argv.
+//   3. WindowsApps `codex.exe` — last resort; likely EPERM but tried so the
+//      caller still fails closed with a precise reason if nothing else exists.
+//
+// Non-Windows platforms and already-qualified paths are returned as a
+// single-element list. When nothing is found, the bare name is returned so
+// spawn() fails closed through spawnError. `whichAll` is injectable for tests.
+export function resolveCodexExecutableCandidates(executable, options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") return [executable];
+  if (typeof executable !== "string" || executable.length === 0) return [executable];
+  const ext = path.extname(executable).toLowerCase();
+  if ([".exe", ".cmd", ".bat", ".ps1"].includes(ext)) return [executable];
+  const whichAll = options.whichAll
+    ?? (typeof options.which === "function"
+      ? (name) => { const hit = options.which(name); return hit ? [hit] : []; }
+      : defaultWhichAll);
+  const exeHits = whichAll(`${executable}.exe`);
+  const cmdHits = whichAll(`${executable}.cmd`);
+  const nonWindowsAppsExe = exeHits.filter((candidate) => !/WindowsApps/i.test(candidate));
+  const windowsAppsExe = exeHits.filter((candidate) => /WindowsApps/i.test(candidate));
+  const ordered = [...nonWindowsAppsExe, ...cmdHits, ...windowsAppsExe];
+  const seen = new Set();
+  const unique = ordered.filter((candidate) => {
+    if (seen.has(candidate)) return false;
+    seen.add(candidate);
+    return true;
+  });
+  return unique.length > 0 ? unique : [executable];
 }
 
 export function codexInvocation(executable, args = [], platform = process.platform, options = {}) {

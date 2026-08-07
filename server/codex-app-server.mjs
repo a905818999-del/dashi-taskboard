@@ -11,7 +11,7 @@
 
 import { spawn } from "node:child_process";
 
-import { codexInvocation, codexSpawnOptions, terminateProcessTree } from "./ai-chat-process.mjs";
+import { codexInvocation, codexSpawnOptions, resolveCodexExecutableCandidates, terminateProcessTree } from "./ai-chat-process.mjs";
 
 const READ_TIMEOUT_MS = 15_000;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -62,6 +62,30 @@ function statusOf(item, fallback) {
   return fallback;
 }
 
+// Extract a visible text string from a user/agent message item. The real Codex
+// App Server returns userMessage items as `{ id, content }` where `content` is
+// a list of user inputs (e.g. `{ type: "text", text }`, `{ type: "image", ... }`,
+// `{ type: "localImage", ... }`). Older/flat shapes used `item.text` or
+// `item.message` as a plain string. We try the real `content` container first
+// (array → join the text parts; string → use directly), then fall back to the
+// flat fields. Image/audio/skill/mention parts carry no visible text and are
+// skipped. The result is always capped; never returns raw protocol payloads.
+function extractContent(item) {
+  const content = item.content;
+  if (typeof content === "string") return cap(content);
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      // Text parts use `text` under variants {type:"text"} | {type:"input_text"}.
+      const text = typeof part.text === "string" ? part.text : (typeof part.content === "string" ? part.content : "");
+      if (text) parts.push(text);
+    }
+    return cap(parts.join("\n"));
+  }
+  return cap(item.text ?? item.message);
+}
+
 // Normalize a single App Server turn item into a safe visible event, or return
 // null when the item must be dropped (reasoning, system/developer content,
 // hidden prompts, raw protocol messages, unknown sensitive payloads).
@@ -87,7 +111,7 @@ export function normalizeAppServerTurnItem(item, context = {}) {
     return {
       ...base,
       role: "user",
-      content: cap(item.text ?? item.message),
+      content: extractContent(item),
       data: { status: "completed", ...(sourceItemId ? { itemId: sourceItemId } : {}) },
     };
   }
@@ -96,7 +120,7 @@ export function normalizeAppServerTurnItem(item, context = {}) {
     return {
       ...base,
       role: "assistant",
-      content: cap(item.text ?? item.message),
+      content: extractContent(item),
       data: { status: statusOf(item, "completed"), ...(sourceItemId ? { itemId: sourceItemId } : {}) },
     };
   }
@@ -231,27 +255,41 @@ export function readCodexThread({
   processEnv = process.env,
   timeoutMs = READ_TIMEOUT_MS,
   maxResponseBytes = MAX_RESPONSE_BYTES,
+  platform = process.platform,
+  whichAll,
 }) {
   if (typeof codexThreadId !== "string" || !codexThreadId.trim()) {
     throw new Error("A codex thread id is required");
   }
   return new Promise((resolve, reject) => {
-    const invocation = codexInvocation(codexExecutable, ["app-server", "--listen", "stdio://"]);
+    // Existence on PATH is NOT proof Node can spawn a candidate: on Windows an
+    // MSIX `WindowsApps\codex.exe` exists but throws synchronous EPERM under
+    // spawn(shell:false). resolveCodexExecutableCandidates returns an ordered
+    // list (non-WindowsApps .exe, then .cmd, then WindowsApps .exe); we try
+    // each in turn and fall back to the next on a synchronous spawn failure.
+    // This fallback happens BEFORE any protocol/session write (no initialize /
+    // thread/read has been sent), so no Codex App state is touched. Only when
+    // every candidate fails synchronously do we fail closed with a precise
+    // reason. `platform`/`whichAll` are injectable for cross-platform tests.
+    const candidatePaths = resolveCodexExecutableCandidates(codexExecutable, { platform, whichAll });
     let child;
-    // spawn() can throw synchronously (e.g. Windows EPERM when the Codex App
-    // holds a lock, or ENOENT/EACCES) before a child object exists, so the
-    // per-child error handlers below would never run. Catch the synchronous
-    // throw and fail closed with a precise reason. We never bypass the OS
-    // lock or modify Codex App storage.
-    try {
-      child = spawn(invocation.executable, invocation.args, {
-        cwd: workspacePath,
-        env: processEnv,
-        stdio: ["pipe", "pipe", "ignore"],
-        ...codexSpawnOptions(invocation.executable),
-      });
-    } catch (error) {
-      reject(spawnError(error));
+    let lastError = null;
+    for (const candidatePath of candidatePaths) {
+      const invocation = codexInvocation(candidatePath, ["app-server", "--listen", "stdio://"], platform);
+      try {
+        child = spawn(invocation.executable, invocation.args, {
+          cwd: workspacePath,
+          env: processEnv,
+          stdio: ["pipe", "pipe", "ignore"],
+          ...codexSpawnOptions(invocation.executable, platform),
+        });
+        break;
+      } catch (error) {
+        lastError = spawnError(error);
+      }
+    }
+    if (!child) {
+      reject(lastError || new Error("Codex app-server failed to start: no spawnable candidate found"));
       return;
     }
 
