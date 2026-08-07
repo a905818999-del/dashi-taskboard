@@ -204,9 +204,44 @@ export function normalizeAppServerTurnItem(item, context = {}) {
   return null;
 }
 
+// Statuses that mean the Codex App is currently active on this thread (a turn
+// is mid-flight: in progress / running / streaming). When the App reports one
+// of these, the cross-client write gate must fail closed: only one writer
+// (App or browser) may be active on a Codex thread at a time. Matched
+// case-insensitively and tolerant of `in_progress` vs `in-progress`.
+const BUSY_STATUSES = new Set([
+  "in_progress", "in-progress", "running", "active", "streaming", "busy", "pending", "processing",
+]);
+
+function isBusyStatus(value) {
+  if (typeof value !== "string") return false;
+  return BUSY_STATUSES.has(value.trim().toLowerCase());
+}
+
+// The App/CLI mutual-exclusion predicate. Inspects the `thread/read` response
+// for any positive busy/in-progress signal — thread-level `busy`/`status` or a
+// turn currently in progress. A positive signal anywhere means another writer
+// (the App) holds the thread and the browser must not write. When no busy
+// signal is present the thread is treated as quiescent; this is the read side
+// of mutual exclusion, complementing the browser-side run mutex in
+// assertBrowserWriteAllowed. Race-free exclusion still requires App-side
+// writer-lock cooperation (undocumented), so browser writes stay disabled at
+// the master switch (browserWriteEnabled) until proven on a real host.
+function threadIsBusy(thread) {
+  if (!thread || typeof thread !== "object" || Array.isArray(thread)) return false;
+  if (thread.busy === true) return true;
+  if (isBusyStatus(thread.status)) return true;
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  return turns.some((turn) => (
+    turn && typeof turn === "object" && !Array.isArray(turn)
+    && (turn.busy === true || isBusyStatus(turn.status))
+  ));
+}
+
 // Normalize the full `thread/read` result into a flat ordered list of visible
-// events plus the verified thread id. Drops anything that is not an approved
-// visible item. Never returns raw turns or unknown payloads.
+// events plus the verified thread id and the App/CLI mutual-exclusion signal.
+// Drops anything that is not an approved visible item. Never returns raw turns
+// or unknown payloads.
 export function normalizeAppServerThread(result, expectedThreadId) {
   if (!result || typeof result !== "object" || Array.isArray(result)) {
     throw new Error("App Server returned an invalid thread response");
@@ -230,6 +265,10 @@ export function normalizeAppServerThread(result, expectedThreadId) {
   const turns = Array.isArray(threadWrapper?.turns)
     ? threadWrapper.turns
     : (Array.isArray(result.turns) ? result.turns : []);
+  // App/CLI mutual-exclusion signal: a busy/in-progress thread or turn means
+  // the App is the active writer and the browser must fail closed. Computed
+  // from whichever shape the response used (wrapper or flat).
+  const busy = threadWrapper ? threadIsBusy(threadWrapper) : threadIsBusy(result);
   const events = [];
   let sourceOrder = 0;
   for (const turn of turns) {
@@ -242,7 +281,7 @@ export function normalizeAppServerThread(result, expectedThreadId) {
       if (normalized) events.push(normalized);
     }
   }
-  return { threadId, events };
+  return { threadId, events, busy };
 }
 
 // Start a short-lived App Server, call thread/read for an exact id, verify it,

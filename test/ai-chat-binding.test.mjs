@@ -908,3 +908,150 @@ stdin.on("data", (chunk) => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("mutual-exclusion predicate: normalizeAppServerThread reports busy:true from a thread-level in_progress status", () => {
+  // The App is mid-turn: the App Server reports the thread itself as
+  // in_progress. The browser must see the App as the active writer.
+  const result = normalizeAppServerThread({
+    thread: {
+      id: "T",
+      status: "in_progress",
+      turns: [{ id: "t1", items: [{ type: "userMessage", id: "i1", text: "A1" }] }],
+    },
+  }, "T");
+  assert.equal(result.busy, true);
+  // Visible history is still normalized; the predicate is independent of import.
+  assert.equal(result.events.length, 1);
+});
+
+test("mutual-exclusion predicate: normalizeAppServerThread reports busy:true when a turn is mid-flight", () => {
+  // Completed history plus a still-running turn: the App holds the thread.
+  const result = normalizeAppServerThread({
+    thread: {
+      id: "T",
+      turns: [
+        { id: "t1", status: "completed", items: [{ type: "userMessage", id: "i1", text: "A1" }] },
+        { id: "t2", status: "running", items: [{ type: "agentMessage", id: "i2", text: "..." }] },
+      ],
+    },
+  }, "T");
+  assert.equal(result.busy, true);
+});
+
+test("mutual-exclusion predicate: normalizeAppServerThread reports busy:true from an explicit thread.busy boolean", () => {
+  const result = normalizeAppServerThread({
+    thread: { id: "T", busy: true, turns: [] },
+  }, "T");
+  assert.equal(result.busy, true);
+});
+
+test("mutual-exclusion predicate: normalizeAppServerThread reports busy:false for a quiescent thread whose turns are completed", () => {
+  const result = normalizeAppServerThread({
+    thread: {
+      id: "T",
+      status: "idle",
+      turns: [{ id: "t1", status: "completed", items: [
+        { type: "userMessage", id: "i1", text: "A1" },
+        { type: "agentMessage", id: "i2", text: "A1 reply", status: "completed" },
+      ]}],
+    },
+  }, "T");
+  assert.equal(result.busy, false);
+});
+
+test("mutual-exclusion predicate: normalizeAppServerThread reports busy:false for an empty/idle thread with no status signal", () => {
+  assert.equal(normalizeAppServerThread({ thread: { id: "T", turns: [] } }, "T").busy, false);
+  assert.equal(normalizeAppServerThread({ threadId: "T", turns: [] }, "T").busy, false);
+});
+
+test("mutual-exclusion predicate: assertBrowserWriteAllowed fails closed with CODEX_THREAD_BUSY when the App reports the thread is busy", async () => {
+  // The App is the active writer (busy). Even though no Dashi run is in
+  // flight, the cross-client write gate must reject the browser turn.
+  const fixture = await createDatabase();
+  try {
+    const task = createTask(fixture.database);
+    fixture.database.createAiChatThread({
+      title: "T", status: "idle", lifecycle: "task_bound",
+      origin: { projectId: task.projectId, projectName: "P", workspacePath: "/tmp", issueId: task.id, issueIdentifier: task.identifier },
+      codexThreadId: "T", model: "gpt", reasoningEffort: "medium", sandbox: "read-only",
+    });
+    fixture.database.createTaskCodexBinding({ taskId: task.id, codexThreadId: "T", state: "active", source: "app" });
+    const service = new AiChatBindingService({
+      database: fixture.database, codexExecutable: "codex",
+      readThread: makeReader({ threadId: "T", events: [], busy: true }),
+    });
+    await assert.rejects(service.assertBrowserWriteAllowed(task.id), (error) => (
+      error.code === "CODEX_THREAD_BUSY" && /busy/i.test(error.message)
+    ));
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("mutual-exclusion predicate: a real in_progress App Server response blocks the browser write via the quiescence probe", async () => {
+  // End-to-end with the REAL normalizer (not a mock): the exact shape the App
+  // Server returns when a turn is mid-flight is normalized to busy:true and the
+  // gate rejects the browser turn. Proves the predicate is no longer dead code.
+  const fixture = await createDatabase();
+  try {
+    const task = createTask(fixture.database);
+    fixture.database.createAiChatThread({
+      title: "T", status: "idle", lifecycle: "task_bound",
+      origin: { projectId: task.projectId, projectName: "P", workspacePath: "/tmp", issueId: task.id, issueIdentifier: task.identifier },
+      codexThreadId: "T", model: "gpt", reasoningEffort: "medium", sandbox: "read-only",
+    });
+    fixture.database.createTaskCodexBinding({ taskId: task.id, codexThreadId: "T", state: "active", source: "app" });
+    const realReader = async () => normalizeAppServerThread({
+      thread: {
+        id: "T",
+        status: "in_progress",
+        turns: [{ id: "t1", status: "in_progress", items: [
+          { type: "userMessage", id: "item-1", content: [{ type: "text", text: "A1 real content" }] },
+        ]}],
+      },
+    }, "T");
+    const service = new AiChatBindingService({
+      database: fixture.database, codexExecutable: "codex",
+      readThread: realReader,
+    });
+    await assert.rejects(service.assertBrowserWriteAllowed(task.id), (error) => (
+      error.code === "CODEX_THREAD_BUSY" && /busy/i.test(error.message)
+    ));
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("mutual-exclusion predicate: a quiescent App Server response lets the browser write gate pass", async () => {
+  // End-to-end with the REAL normalizer: a completed/idle thread reports
+  // busy:false and the gate proceeds to return the verified binding.
+  const fixture = await createDatabase();
+  try {
+    const task = createTask(fixture.database);
+    fixture.database.createAiChatThread({
+      title: "T", status: "idle", lifecycle: "task_bound",
+      origin: { projectId: task.projectId, projectName: "P", workspacePath: "/tmp", issueId: task.id, issueIdentifier: task.identifier },
+      codexThreadId: "T", model: "gpt", reasoningEffort: "medium", sandbox: "read-only",
+    });
+    fixture.database.createTaskCodexBinding({ taskId: task.id, codexThreadId: "T", state: "active", source: "app" });
+    const realReader = async () => normalizeAppServerThread({
+      thread: {
+        id: "T",
+        status: "idle",
+        turns: [{ id: "t1", status: "completed", items: [
+          { type: "userMessage", id: "item-1", content: [{ type: "text", text: "A1 real content" }] },
+          { type: "agentMessage", id: "item-2", text: "A1 reply", status: "completed" },
+        ]}],
+      },
+    }, "T");
+    const service = new AiChatBindingService({
+      database: fixture.database, codexExecutable: "codex",
+      readThread: realReader,
+    });
+    const gate = await service.assertBrowserWriteAllowed(task.id);
+    assert.equal(gate.binding.codexThreadId, "T");
+    assert.equal(gate.readResult.busy, false);
+  } finally {
+    await fixture.close();
+  }
+});
