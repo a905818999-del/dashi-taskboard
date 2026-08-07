@@ -1198,6 +1198,26 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
   }, [available, loadThreads]);
 
   useEffect(() => {
+    function openTaskConversation(event: Event) {
+      const detail = (event as CustomEvent<{ projectId: string; issueId: string }>).detail;
+      if (!detail || detail.projectId !== projectId || detail.issueId !== issueId) return;
+      const existing = threads.find((thread) => (
+        thread.origin.projectId === detail.projectId
+        && thread.origin.issueId === detail.issueId
+      ));
+      setPanelOpen(true);
+      if (existing) {
+        setDraftOrigin(null);
+        selectThread(existing.id);
+      } else {
+        beginNewConversation();
+      }
+    }
+    window.addEventListener('taskboard:open-ai-chat', openTaskConversation);
+    return () => window.removeEventListener('taskboard:open-ai-chat', openTaskConversation);
+  }, [issueId, projectId, threads]);
+
+  useEffect(() => {
     setSnapshot(null);
     if (!selectedThreadId) return;
     let initialPending = true;

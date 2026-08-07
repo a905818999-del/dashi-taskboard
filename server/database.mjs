@@ -133,6 +133,7 @@ function aiChatRunFromRow(row) {
     error: row.error,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
+    codexThreadId: row.codex_thread_id ?? null,
   };
 }
 
@@ -141,6 +142,7 @@ function aiChatThreadFromRow(row) {
     id: row.id,
     title: row.title,
     status: row.status,
+    lifecycle: row.lifecycle ?? "task_bound",
     origin: {
       projectId: row.origin_project_id,
       projectName: row.origin_project_name,
@@ -149,6 +151,12 @@ function aiChatThreadFromRow(row) {
       ...(row.origin_issue_identifier ? { issueIdentifier: row.origin_issue_identifier } : {}),
     },
     codexThreadId: row.codex_thread_id,
+    gitState: row.git_root ? {
+      root: row.git_root,
+      branch: row.git_branch,
+      head: row.git_head,
+      status: row.git_status ?? '',
+    } : null,
     model: row.model,
     reasoningEffort: row.reasoning_effort,
     sandbox: row.sandbox,
@@ -167,7 +175,38 @@ function aiChatEventFromRow(row) {
     role: row.role,
     content: row.content,
     data: row.data === null ? null : JSON.parse(row.data),
+    seq: row.seq ?? null,
+    sourceTurnId: row.source_turn_id ?? null,
+    sourceItemId: row.source_item_id ?? null,
+    sourceKey: row.source_key ?? null,
+    sourceOrder: row.source_order ?? null,
+    contentHash: row.content_hash ?? null,
     createdAt: row.created_at,
+  };
+}
+
+function taskCodexBindingFromRow(row) {
+  return {
+    taskId: row.task_id,
+    codexThreadId: row.codex_thread_id,
+    state: row.state,
+    source: row.source,
+    workspacePath: row.workspace_path,
+    version: row.version,
+    error: row.error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function aiChatSyncStateFromRow(row) {
+  return {
+    threadId: row.thread_id,
+    lastSourceKey: row.last_source_key,
+    lastSourceOrder: row.last_source_order ?? null,
+    lastSeq: row.last_seq ?? 0,
+    syncedAt: row.synced_at,
+    error: row.error,
   };
 }
 
@@ -280,6 +319,10 @@ export class TaskboardDatabase {
         origin_issue_id TEXT,
         origin_issue_identifier TEXT,
         codex_thread_id TEXT,
+        git_root TEXT,
+        git_branch TEXT,
+        git_head TEXT,
+        git_status TEXT,
         model TEXT NOT NULL,
         reasoning_effort TEXT NOT NULL,
         sandbox TEXT NOT NULL CHECK (sandbox IN (
@@ -324,6 +367,29 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS ai_chat_events_thread_created
         ON ai_chat_events(thread_id, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS task_codex_bindings (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        codex_thread_id TEXT UNIQUE,
+        state TEXT NOT NULL CHECK (state IN (
+          'adopting', 'active', 'conflict', 'unavailable', 'archived'
+        )),
+        source TEXT NOT NULL CHECK (source IN ('app', 'browser', 'promoted_browser')),
+        workspace_path TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_chat_sync_state (
+        thread_id TEXT PRIMARY KEY REFERENCES ai_chat_threads(id) ON DELETE CASCADE,
+        last_source_key TEXT,
+        last_source_order INTEGER,
+        last_seq INTEGER NOT NULL DEFAULT 0,
+        synced_at TEXT,
+        error TEXT
+      );
 
     `);
 
@@ -480,6 +546,70 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE attachments ADD COLUMN comment_id TEXT REFERENCES comments(id) ON DELETE CASCADE");
     }
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_created ON attachments(comment_id, created_at, id)");
+
+    const aiThreadColumns = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
+    for (const column of ['git_root', 'git_branch', 'git_head', 'git_status']) {
+      if (!aiThreadColumns.some((current) => current.name === column)) {
+        this.database.exec(`ALTER TABLE ai_chat_threads ADD COLUMN ${column} TEXT`);
+      }
+    }
+    this.database.exec(`
+      UPDATE ai_chat_threads
+      SET origin_issue_id = NULL
+      WHERE origin_issue_id IS NOT NULL
+        AND rowid NOT IN (
+          SELECT MAX(rowid) FROM ai_chat_threads
+          WHERE origin_issue_id IS NOT NULL
+          GROUP BY origin_issue_id
+        );
+      CREATE UNIQUE INDEX IF NOT EXISTS ai_chat_threads_one_issue
+        ON ai_chat_threads(origin_issue_id)
+        WHERE origin_issue_id IS NOT NULL;
+    `);
+
+    // Authoritative Codex thread binding lifecycle. Pre-existing browser-only
+    // conversations predate the binding table and become legacy_browser so the
+    // adopt flow can detect conflicts instead of silently merging transcripts.
+    const lifecycleColumns = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
+    if (!lifecycleColumns.some((column) => column.name === "lifecycle")) {
+      this.database.exec("ALTER TABLE ai_chat_threads ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'task_bound'");
+      this.database.exec("UPDATE ai_chat_threads SET lifecycle = 'legacy_browser'");
+    }
+
+    // Runs remember the verified Codex thread id they wrote to, and only one
+    // active run may exist per Codex thread id (cross-client mutex support).
+    const runColumns = this.database.prepare("PRAGMA table_info(ai_chat_runs)").all();
+    if (!runColumns.some((column) => column.name === "codex_thread_id")) {
+      this.database.exec("ALTER TABLE ai_chat_runs ADD COLUMN codex_thread_id TEXT");
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ai_chat_runs_one_active_codex_thread
+        ON ai_chat_runs(codex_thread_id)
+        WHERE status = 'running' AND codex_thread_id IS NOT NULL;
+    `);
+
+    // Idempotent event import: monotonic per-thread seq, stable source keys,
+    // and a content hash so repeated syncs never duplicate visible history.
+    const eventColumns = this.database.prepare("PRAGMA table_info(ai_chat_events)").all();
+    for (const [column, definition] of [
+      ["seq", "INTEGER"],
+      ["source_turn_id", "TEXT"],
+      ["source_item_id", "TEXT"],
+      ["source_key", "TEXT"],
+      ["source_order", "INTEGER"],
+      ["content_hash", "TEXT"],
+    ]) {
+      if (!eventColumns.some((current) => current.name === column)) {
+        this.database.exec(`ALTER TABLE ai_chat_events ADD COLUMN ${column} ${definition}`);
+      }
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ai_chat_events_source_key
+        ON ai_chat_events(thread_id, source_key)
+        WHERE source_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS ai_chat_events_thread_seq
+        ON ai_chat_events(thread_id, seq, created_at);
+    `);
 
     const timestamp = now();
     this.database.prepare(`
@@ -689,21 +819,130 @@ export class TaskboardDatabase {
     return row ? this.#aiChatThreadWithCurrentRun(row) : null;
   }
 
+  getAiChatThreadForIssue(issueId) {
+    const row = this.database.prepare("SELECT * FROM ai_chat_threads WHERE origin_issue_id = ? LIMIT 1").get(issueId);
+    return row ? this.#aiChatThreadWithCurrentRun(row) : null;
+  }
+
+  getAiChatThreadByCodexThreadId(codexThreadId) {
+    if (!codexThreadId) return null;
+    const row = this.database.prepare(`
+      SELECT * FROM ai_chat_threads WHERE codex_thread_id = ? LIMIT 1
+    `).get(codexThreadId);
+    return row ? this.#aiChatThreadWithCurrentRun(row) : null;
+  }
+
+  // Authoritative task <-> Codex thread binding. One task maps to at most one
+  // Codex thread id; one Codex thread id maps to at most one task. Optimistic
+  // version lets adopt/sync detect concurrent mutation.
+  getTaskCodexBinding(taskId) {
+    const row = this.database.prepare(`
+      SELECT * FROM task_codex_bindings WHERE task_id = ?
+    `).get(taskId);
+    return row ? taskCodexBindingFromRow(row) : null;
+  }
+
+  getTaskCodexBindingByCodexThread(codexThreadId) {
+    if (!codexThreadId) return null;
+    const row = this.database.prepare(`
+      SELECT * FROM task_codex_bindings WHERE codex_thread_id = ?
+    `).get(codexThreadId);
+    return row ? taskCodexBindingFromRow(row) : null;
+  }
+
+  createTaskCodexBinding(input) {
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare(`
+        INSERT INTO task_codex_bindings (
+          task_id, codex_thread_id, state, source, workspace_path, version,
+          error, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        input.taskId,
+        input.codexThreadId ?? null,
+        input.state ?? "adopting",
+        input.source ?? "app",
+        input.workspacePath ?? null,
+        input.error ?? null,
+        timestamp,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getTaskCodexBinding(input.taskId);
+  }
+
+  updateTaskCodexBinding(taskId, version, changes) {
+    const current = this.getTaskCodexBinding(taskId);
+    if (!current) {
+      throw new ApiError(404, "BINDING_NOT_FOUND", `Binding for task '${taskId}' does not exist`);
+    }
+    if (current.version !== version) {
+      throw new ApiError(409, "VERSION_CONFLICT", "Binding was changed by another client", {
+        expectedVersion: version,
+        actualVersion: current.version,
+      });
+    }
+    const columns = {
+      codexThreadId: "codex_thread_id",
+      state: "state",
+      source: "source",
+      workspacePath: "workspace_path",
+      error: "error",
+    };
+    const assignments = [];
+    const values = [];
+    for (const [key, column] of Object.entries(columns)) {
+      if (Object.hasOwn(changes, key)) {
+        assignments.push(`${column} = ?`);
+        values.push(changes[key]);
+      }
+    }
+    if (assignments.length === 0) return current;
+    assignments.push("version = version + 1", "updated_at = ?");
+    values.push(now(), taskId, version);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE task_codex_bindings
+        SET ${assignments.join(", ")}
+        WHERE task_id = ? AND version = ?
+      `).run(...values);
+      if (result.changes !== 1) {
+        throw new ApiError(409, "VERSION_CONFLICT", "Binding was changed by another client", {
+          expectedVersion: version,
+          actualVersion: this.getTaskCodexBinding(taskId)?.version ?? version,
+        });
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getTaskCodexBinding(taskId);
+  }
+
   createAiChatThread(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.createdAt ?? now();
     this.database.prepare(`
       INSERT INTO ai_chat_threads (
-        id, title, status,
+        id, title, status, lifecycle,
         origin_project_id, origin_project_name, origin_workspace_path,
         origin_issue_id, origin_issue_identifier,
         codex_thread_id, model, reasoning_effort, sandbox,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.title,
       input.status ?? "idle",
+      input.lifecycle ?? "task_bound",
       input.origin.projectId,
       input.origin.projectName,
       input.origin.workspacePath,
@@ -727,10 +966,15 @@ export class TaskboardDatabase {
     const columns = {
       title: "title",
       status: "status",
+      lifecycle: "lifecycle",
       codexThreadId: "codex_thread_id",
       model: "model",
       reasoningEffort: "reasoning_effort",
       sandbox: "sandbox",
+      gitRoot: "git_root",
+      gitBranch: "git_branch",
+      gitHead: "git_head",
+      gitStatus: "git_status",
     };
     const assignments = [];
     const values = [];
@@ -777,8 +1021,8 @@ export class TaskboardDatabase {
     try {
       this.database.prepare(`
         INSERT INTO ai_chat_runs (
-          id, thread_id, status, exit_code, error, started_at, finished_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          id, thread_id, status, exit_code, error, started_at, finished_at, codex_thread_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         input.threadId,
@@ -787,6 +1031,7 @@ export class TaskboardDatabase {
         input.error ?? null,
         timestamp,
         input.finishedAt ?? null,
+        input.codexThreadId ?? null,
       );
       if ((input.status ?? "running") === "running") {
         this.database.prepare(`
@@ -853,30 +1098,203 @@ export class TaskboardDatabase {
   insertAiChatEvent(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.createdAt ?? now();
-    this.database.prepare(`
-      INSERT INTO ai_chat_events (
-        id, thread_id, run_id, type, role, content, data, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      input.threadId,
-      input.runId ?? null,
-      input.type,
-      input.role,
-      input.content,
-      input.data === undefined || input.data === null ? null : JSON.stringify(input.data),
-      timestamp,
-    );
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      let seq = input.seq;
+      if (seq === undefined) {
+        const row = this.database.prepare(`
+          SELECT COALESCE(MAX(seq), 0) AS maximum
+          FROM ai_chat_events
+          WHERE thread_id = ? AND seq IS NOT NULL
+        `).get(input.threadId);
+        seq = (row?.maximum ?? 0) + 1;
+      }
+      this.database.prepare(`
+        INSERT INTO ai_chat_events (
+          id, thread_id, run_id, type, role, content, data, created_at,
+          seq, source_turn_id, source_item_id, source_key, source_order, content_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        input.threadId,
+        input.runId ?? null,
+        input.type,
+        input.role,
+        input.content,
+        input.data === undefined || input.data === null ? null : JSON.stringify(input.data),
+        timestamp,
+        seq ?? null,
+        input.sourceTurnId ?? null,
+        input.sourceItemId ?? null,
+        input.sourceKey ?? null,
+        input.sourceOrder ?? null,
+        input.contentHash ?? null,
+      );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
     const row = this.database.prepare("SELECT * FROM ai_chat_events WHERE id = ?").get(id);
     return aiChatEventFromRow(row);
   }
 
-  listAiChatEvents(threadId) {
+  // Idempotent bulk import of normalized App Server events. Events with a
+  // source_key that already exists for this thread are skipped (and their seq
+  // is left untouched). Returns the inserted events in arrival order.
+  importAiChatEvents(threadId, events, runId = null) {
+    const inserted = [];
+    if (!Array.isArray(events) || events.length === 0) return inserted;
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existingKeys = new Set(
+        this.database.prepare(`
+          SELECT source_key FROM ai_chat_events
+          WHERE thread_id = ? AND source_key IS NOT NULL
+        `).all(threadId).map((row) => row.source_key),
+      );
+      const seqRow = this.database.prepare(`
+        SELECT COALESCE(MAX(seq), 0) AS maximum
+        FROM ai_chat_events
+        WHERE thread_id = ? AND seq IS NOT NULL
+      `).get(threadId);
+      let seq = (seqRow?.maximum ?? 0) + 1;
+      const timestamp = now();
+      const insert = this.database.prepare(`
+        INSERT INTO ai_chat_events (
+          id, thread_id, run_id, type, role, content, data, created_at,
+          seq, source_turn_id, source_item_id, source_key, source_order, content_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const event of events) {
+        if (!event || typeof event !== "object") continue;
+        const sourceKey = event.sourceKey ?? null;
+        if (sourceKey && existingKeys.has(sourceKey)) continue;
+        const id = randomUUID();
+        insert.run(
+          id,
+          threadId,
+          event.runId ?? runId ?? null,
+          event.type,
+          event.role,
+          event.content ?? "",
+          event.data === undefined || event.data === null ? null : JSON.stringify(event.data),
+          event.createdAt ?? timestamp,
+          seq,
+          event.sourceTurnId ?? null,
+          event.sourceItemId ?? null,
+          sourceKey,
+          Number.isInteger(event.sourceOrder) ? event.sourceOrder : null,
+          event.contentHash ?? null,
+        );
+        seq += 1;
+        if (sourceKey) existingKeys.add(sourceKey);
+        inserted.push(aiChatEventFromRow(this.database.prepare("SELECT * FROM ai_chat_events WHERE id = ?").get(id)));
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return inserted;
+  }
+
+  listAiChatEvents(threadId, options = {}) {
+    const afterSeq = Number.isInteger(options.afterSeq) ? options.afterSeq : null;
+    if (afterSeq === null) {
+      return this.database.prepare(`
+        SELECT * FROM ai_chat_events
+        WHERE thread_id = ?
+        ORDER BY seq, rowid
+      `).all(threadId).map(aiChatEventFromRow);
+    }
     return this.database.prepare(`
       SELECT * FROM ai_chat_events
-      WHERE thread_id = ?
-      ORDER BY created_at, rowid
-    `).all(threadId).map(aiChatEventFromRow);
+      WHERE thread_id = ? AND seq IS NOT NULL AND seq > ?
+      ORDER BY seq, rowid
+    `).all(threadId, afterSeq).map(aiChatEventFromRow);
+  }
+
+  getAiChatSyncState(threadId) {
+    const row = this.database.prepare(`
+      SELECT * FROM ai_chat_sync_state WHERE thread_id = ?
+    `).get(threadId);
+    return row ? aiChatSyncStateFromRow(row) : null;
+  }
+
+  upsertAiChatSyncState(threadId, changes) {
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.database.prepare(`
+        SELECT * FROM ai_chat_sync_state WHERE thread_id = ?
+      `).get(threadId);
+      if (!current) {
+        this.database.prepare(`
+          INSERT INTO ai_chat_sync_state (
+            thread_id, last_source_key, last_source_order, last_seq, synced_at, error
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          threadId,
+          changes.lastSourceKey ?? null,
+          changes.lastSourceOrder ?? null,
+          changes.lastSeq ?? 0,
+          changes.error ? null : timestamp,
+          changes.error ?? null,
+        );
+      } else {
+        const assignments = [];
+        const values = [];
+        for (const [key, column] of [
+          ["lastSourceKey", "last_source_key"],
+          ["lastSourceOrder", "last_source_order"],
+          ["lastSeq", "last_seq"],
+        ]) {
+          if (Object.hasOwn(changes, key)) {
+            assignments.push(`${column} = ?`);
+            values.push(changes[key]);
+          }
+        }
+        if (Object.hasOwn(changes, "error")) {
+          assignments.push("error = ?");
+          values.push(changes.error ?? null);
+          if (changes.error === null || changes.error === undefined) {
+            assignments.push("synced_at = ?");
+            values.push(timestamp);
+          }
+        } else if (assignments.length > 0) {
+          assignments.push("synced_at = ?");
+          values.push(timestamp);
+        }
+        if (assignments.length === 0) {
+          this.database.exec("COMMIT");
+          return this.getAiChatSyncState(threadId);
+        }
+        values.push(threadId);
+        this.database.prepare(`
+          UPDATE ai_chat_sync_state SET ${assignments.join(", ")} WHERE thread_id = ?
+        `).run(...values);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getAiChatSyncState(threadId);
+  }
+
+  // Returns true when any ai_chat_runs row is currently running for any local
+  // thread bound to this Codex thread id. Used as the cross-client writer
+  // mutex check before a browser turn starts.
+  hasActiveRunForCodexThread(codexThreadId) {
+    if (!codexThreadId) return false;
+    const row = this.database.prepare(`
+      SELECT 1 AS hit
+      FROM ai_chat_runs
+      WHERE codex_thread_id = ? AND status = 'running'
+      LIMIT 1
+    `).get(codexThreadId);
+    return Boolean(row);
   }
 
   interruptAbandonedAiChatRuns() {

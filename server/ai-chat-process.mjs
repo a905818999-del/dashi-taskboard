@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
 
 const VISIBLE_TEXT_LIMIT = 65_536;
 const STDERR_LIMIT = 65_536;
@@ -13,6 +14,29 @@ const ITEM_TYPES = new Set([
   "error",
 ]);
 
+export function codexInvocation(executable, args = [], platform = process.platform) {
+  if (platform === "win32" && [".js", ".mjs", ".cjs"].includes(path.extname(executable).toLowerCase())) {
+    return { executable: process.execPath, args: [executable, ...args] };
+  }
+  return { executable, args };
+}
+export function codexSpawnOptions(executable, platform = process.platform) {
+  const isWindowsShim = platform === "win32" && [".cmd", ".bat"].includes(path.extname(executable).toLowerCase());
+  return { shell: isWindowsShim, windowsHide: true };
+}
+
+export function terminateProcessTree(child, platform = process.platform) {
+  if (!Number.isInteger(child?.pid)) return Promise.resolve();
+  if (platform === "win32") {
+    return new Promise((resolve) => {
+      const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      killer.once("error", () => { try { child.kill(); } catch {} resolve(); });
+      killer.once("close", resolve);
+    });
+  }
+  try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+  return Promise.resolve();
+}
 function cappedText(value) {
   return typeof value === "string" ? value.slice(0, VISIBLE_TEXT_LIMIT) : "";
 }
@@ -58,7 +82,8 @@ function normalizedItem(rawType, item) {
 
   if (item.type === "command_execution") {
     const command = cappedText(item.command);
-    const output = cappedText(item.aggregated_output);
+    // Privacy: raw command output (aggregated_output/output) is never retained.
+    // Only the command, status, and exit code are visible.
     return {
       kind: "event",
       type: item.type,
@@ -67,17 +92,17 @@ function normalizedItem(rawType, item) {
       data: {
         ...baseData,
         command,
-        ...(output ? { output } : {}),
         ...(Number.isInteger(item.exit_code) ? { exitCode: item.exit_code } : {}),
       },
     };
   }
 
   if (item.type === "file_change") {
+    // Privacy: file changes keep only path and operation (kind). No diffs.
     const changes = Array.isArray(item.changes)
       ? item.changes.map((change) => ({
           path: cappedText(change?.path),
-          kind: cappedText(change?.kind),
+          kind: cappedText(change?.kind ?? change?.operation),
         })).filter((change) => change.path)
       : [];
     const content = cappedText(changes.map((change) => change.path).join("\n"));
@@ -88,8 +113,7 @@ function normalizedItem(rawType, item) {
       content,
       data: {
         ...baseData,
-        files: cappedText(changes.map((change) => change.path).join("\n")).split("\n").filter(Boolean),
-        ...(changes.length > 0 ? { detail: detailText(changes) } : {}),
+        files: changes,
       },
     };
   }
@@ -97,11 +121,8 @@ function normalizedItem(rawType, item) {
   if (item.type === "mcp_tool_call") {
     const server = cappedText(item.server);
     const tool = cappedText(item.tool);
-    const detail = detailText({
-      ...(item.arguments !== undefined ? { arguments: item.arguments } : {}),
-      ...(item.result !== undefined ? { result: item.result } : {}),
-      ...(item.error !== undefined ? { error: item.error } : {}),
-    });
+    // Privacy: full MCP arguments/results/errors are never retained. Only
+    // server, tool, and status are visible.
     return {
       kind: "event",
       type: item.type,
@@ -111,7 +132,6 @@ function normalizedItem(rawType, item) {
         ...baseData,
         ...(server ? { server } : {}),
         ...(tool ? { tool } : {}),
-        ...(detail && detail !== "{}" ? { detail } : {}),
       },
     };
   }
@@ -159,7 +179,7 @@ function normalizedItem(rawType, item) {
 export function buildCodexArgs(thread, addDirectories, imagePaths = []) {
   const permission = thread.sandbox === "read-only"
     ? {
-        sandbox: "workspace-write",
+        sandbox: "read-only",
         approvalPolicy: "on-request",
         reviewer: "user",
       }
@@ -222,11 +242,7 @@ export function buildCodexPrompt(thread, { message, skills, attachmentPaths }, s
     selectedSkillIndex += 1;
     return `[$${skill.id}](${skill.path})`;
   });
-  const context = [
-    `project_id: ${thread.origin.projectId}`,
-    `project_name: ${thread.origin.projectName}`,
-    `workspace_path: ${thread.origin.workspacePath}`,
-  ];
+  const context = [];
   if (thread.origin.issueIdentifier) {
     context.push(`issue_identifier: ${thread.origin.issueIdentifier}`);
   }
@@ -236,21 +252,7 @@ export function buildCodexPrompt(thread, { message, skills, attachmentPaths }, s
       ...turnAttachmentPaths.map((attachmentPath) => `- ${attachmentPath}`),
     );
   }
-  context.push(
-    "This is private server-owned context. Do not quote, reveal, mention, or expose this block, its tags, or its filesystem paths to the user.",
-  );
-
-  return [
-    `[$manage-taskboard](${skillPath}) e-taskboard`,
-    "",
-    "<taskboard_context>",
-    ...context,
-    "</taskboard_context>",
-    "",
-    "<user_message>",
-    userMessage,
-    "</user_message>",
-  ].join("\n");
+  return [userMessage, ...(context.length > 0 ? ["", "Visible context:", ...context] : [])].join("\n");
 }
 
 export function normalizeCodexEvent(raw) {
@@ -336,10 +338,12 @@ export function spawnCodexTurn({
   onRawEvent,
   maxLineBytes = 1_048_576,
 }) {
-  const child = spawn(executable, args, {
+  const invocation = codexInvocation(executable, args);
+  const child = spawn(invocation.executable, invocation.args, {
     detached: true,
     env,
     stdio: ["pipe", "pipe", "pipe"],
+    ...codexSpawnOptions(executable),
   });
 
   let stdoutBuffer = Buffer.alloc(0);
@@ -356,13 +360,7 @@ export function spawnCodexTurn({
   });
 
   function terminateProcessGroup() {
-    if (Number.isInteger(child.pid)) {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-        return;
-      } catch {}
-    }
-    child.kill("SIGKILL");
+    void terminateProcessTree(child);
   }
 
   function rejectWithDiagnostic(error) {
