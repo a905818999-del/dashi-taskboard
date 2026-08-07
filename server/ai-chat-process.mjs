@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 
 const VISIBLE_TEXT_LIMIT = 65_536;
@@ -14,11 +15,56 @@ const ITEM_TYPES = new Set([
   "error",
 ]);
 
-export function codexInvocation(executable, args = [], platform = process.platform) {
-  if (platform === "win32" && [".js", ".mjs", ".cjs"].includes(path.extname(executable).toLowerCase())) {
-    return { executable: process.execPath, args: [executable, ...args] };
+// Windows-aware PATH lookup for a single candidate file name. Returns the
+// first existing file path on PATH (or the absolute path when `name` is
+// absolute), or null. Only used on win32 in production; tests inject a fake
+// `which` to avoid filesystem/PATH dependence.
+function defaultWhich(name) {
+  if (typeof name !== "string" || name.length === 0) return null;
+  if (path.isAbsolute(name)) {
+    try { return existsSync(name) && statSync(name).isFile() ? name : null; } catch { return null; }
   }
-  return { executable, args };
+  const pathEnv = process.env.PATH || "";
+  const sep = process.platform === "win32" ? ";" : ":";
+  for (const dir of pathEnv.split(sep)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
+    } catch {}
+  }
+  return null;
+}
+
+// Resolve a bare Codex executable name on Windows to a concrete, spawnable
+// path. Node's spawn(shell:false) with a bare "codex" can hit the extensionless
+// npm Unix shim that npm installs alongside codex.cmd, which then fails with
+// EPERM (it is not a valid Windows executable). Prefer `codex.exe` (the Codex
+// App's real binary, which needs no shell and has no injection surface), then
+// fall back to `codex.cmd` (npm shim, which requires shell:true). Non-Windows
+// platforms and already-qualified paths (with .exe/.cmd/.bat/.ps1) are returned
+// unchanged; if nothing is found, the bare name is returned so spawn() fails
+// closed through spawnError. `which` is injectable for cross-platform tests.
+export function resolveCodexExecutable(executable, options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") return executable;
+  if (typeof executable !== "string" || executable.length === 0) return executable;
+  const ext = path.extname(executable).toLowerCase();
+  if ([".exe", ".cmd", ".bat", ".ps1"].includes(ext)) return executable;
+  const which = options.which ?? defaultWhich;
+  for (const candidateExt of [".exe", ".cmd"]) {
+    const found = which(`${executable}${candidateExt}`);
+    if (found) return found;
+  }
+  return executable;
+}
+
+export function codexInvocation(executable, args = [], platform = process.platform, options = {}) {
+  const resolved = resolveCodexExecutable(executable, { platform, which: options.which });
+  if (platform === "win32" && [".js", ".mjs", ".cjs"].includes(path.extname(resolved).toLowerCase())) {
+    return { executable: process.execPath, args: [resolved, ...args] };
+  }
+  return { executable: resolved, args };
 }
 export function codexSpawnOptions(executable, platform = process.platform) {
   const isWindowsShim = platform === "win32" && [".cmd", ".bat"].includes(path.extname(executable).toLowerCase());
@@ -343,7 +389,7 @@ export function spawnCodexTurn({
     detached: true,
     env,
     stdio: ["pipe", "pipe", "pipe"],
-    ...codexSpawnOptions(executable),
+    ...codexSpawnOptions(invocation.executable),
   });
 
   let stdoutBuffer = Buffer.alloc(0);

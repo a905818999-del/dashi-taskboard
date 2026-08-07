@@ -11,7 +11,7 @@ import {
   normalizeAppServerThread,
   readCodexThread,
 } from "../server/codex-app-server.mjs";
-import { normalizeCodexEvent } from "../server/ai-chat-process.mjs";
+import { normalizeCodexEvent, resolveCodexExecutable, codexInvocation, codexSpawnOptions } from "../server/ai-chat-process.mjs";
 
 async function createDatabase() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-binding-"));
@@ -644,4 +644,108 @@ test("adopt marks the binding unavailable and never falls back when the App Serv
   } finally {
     await fixture.close();
   }
+});
+
+test("resolveCodexExecutable: Windows bare name resolves to codex.exe preferentially (no shell, no injection surface)", () => {
+  const seen = [];
+  const which = (name) => { seen.push(name); return name === "codex.exe" ? "C:\\npm\\codex.exe" : null; };
+  const resolved = resolveCodexExecutable("codex", { platform: "win32", which });
+  assert.equal(resolved, "C:\\npm\\codex.exe");
+  // .exe is tried before .cmd and the resolver stops at the first hit, so
+  // codex.cmd is never probed.
+  assert.deepEqual(seen, ["codex.exe"]);
+  // An .exe path needs no shell → no command-injection surface for
+  // user-influenced thread/workspace values passed as args.
+  assert.equal(codexSpawnOptions(resolved, "win32").shell, false);
+});
+
+test("resolveCodexExecutable: Windows bare name falls back to codex.cmd when no .exe exists", () => {
+  const which = (name) => (name === "codex.cmd" ? "C:\\npm\\codex.cmd" : null);
+  const resolved = resolveCodexExecutable("codex", { platform: "win32", which });
+  assert.equal(resolved, "C:\\npm\\codex.cmd");
+  // .cmd requires shell:true on Windows (Node cannot exec it otherwise); args
+  // are still passed as an array so Node escapes them.
+  assert.equal(codexSpawnOptions(resolved, "win32").shell, true);
+});
+
+test("resolveCodexExecutable: returns the bare name unchanged when neither .exe nor .cmd is found (fail-closed via spawn)", () => {
+  const which = () => null;
+  const resolved = resolveCodexExecutable("codex", { platform: "win32", which });
+  assert.equal(resolved, "codex");
+});
+
+test("resolveCodexExecutable: non-Windows and already-qualified paths are returned unchanged", () => {
+  const boom = () => { throw new Error("which must not be called"); };
+  assert.equal(resolveCodexExecutable("codex", { platform: "linux", which: boom }), "codex");
+  assert.equal(resolveCodexExecutable("C:\\App\\codex.exe", { platform: "win32", which: boom }), "C:\\App\\codex.exe");
+  assert.equal(resolveCodexExecutable("codex.cmd", { platform: "win32", which: boom }), "codex.cmd");
+});
+
+test("codexInvocation: Windows bare 'codex' resolves to .exe and spawns without a shell (avoids the extensionless npm Unix shim → EPERM)", () => {
+  const which = (name) => (name === "codex.exe" ? "C:\\npm\\codex.exe" : null);
+  const invocation = codexInvocation("codex", ["app-server", "--listen", "stdio://"], "win32", { which });
+  assert.equal(invocation.executable, "C:\\npm\\codex.exe");
+  assert.deepEqual(invocation.args, ["app-server", "--listen", "stdio://"]);
+  // The resolved .exe path is what codexSpawnOptions sees → shell:false.
+  assert.equal(codexSpawnOptions(invocation.executable, "win32").shell, false);
+});
+
+test("codexInvocation: Windows bare 'codex' with only a .cmd shim resolves to .cmd and requires shell:true", () => {
+  const which = (name) => (name === "codex.cmd" ? "C:\\npm\\codex.cmd" : null);
+  const invocation = codexInvocation("codex", ["app-server", "--listen", "stdio://"], "win32", { which });
+  assert.equal(invocation.executable, "C:\\npm\\codex.cmd");
+  assert.equal(codexSpawnOptions(invocation.executable, "win32").shell, true);
+});
+
+test("normalizeAppServerThread accepts the real App Server wrapper shape result.thread = { id, turns }", () => {
+  const result = normalizeAppServerThread({
+    thread: {
+      id: "T",
+      turns: [
+        { id: "t1", items: [
+          { type: "userMessage", id: "i1", text: "hello" },
+          { type: "commandExecution", id: "c1", command: "npm test", aggregatedOutput: "SECRET", exitCode: 0 },
+        ]},
+      ],
+    },
+  }, "T");
+  assert.equal(result.threadId, "T");
+  assert.equal(result.events.length, 2);
+  // Privacy still holds on the real shape: command output is dropped.
+  const cmd = result.events.find((e) => e.type === "commandExecution");
+  assert.equal(cmd.data.command, "npm test");
+  assert.equal(cmd.data.output, undefined);
+  assert.equal(JSON.stringify(result).includes("SECRET"), false);
+});
+
+test("normalizeAppServerThread verifies thread.id inside the wrapper and rejects a mismatch", () => {
+  assert.throws(
+    () => normalizeAppServerThread({ thread: { id: "DIFFERENT", turns: [] } }, "T"),
+    /different thread id/,
+  );
+  // A wrapper with a missing/non-string id falls back to the flat shape, and
+  // when that is also absent it fails closed with an invalid-thread-id error.
+  assert.throws(
+    () => normalizeAppServerThread({ thread: { turns: [] } }, "T"),
+    /invalid thread id/,
+  );
+});
+
+test("normalizeAppServerThread still accepts the flat compatibility shape (result.threadId + result.turns)", () => {
+  const result = normalizeAppServerThread({
+    threadId: "T",
+    turns: [{ id: "t1", items: [{ type: "agentMessage", id: "i1", text: "ok" }] }],
+  }, "T");
+  assert.equal(result.threadId, "T");
+  assert.equal(result.events.length, 1);
+  assert.equal(result.events[0].content, "ok");
+});
+
+test("normalizeAppServerThread prefers the wrapper thread over the flat fields when both are present", () => {
+  const result = normalizeAppServerThread({
+    threadId: "FLAT",
+    thread: { id: "WRAPPED", turns: [{ id: "t1", items: [{ type: "userMessage", id: "i1", text: "wrapped" }] }] },
+  }, "WRAPPED");
+  assert.equal(result.threadId, "WRAPPED");
+  assert.equal(result.events[0].content, "wrapped");
 });

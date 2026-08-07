@@ -187,14 +187,25 @@ export function normalizeAppServerThread(result, expectedThreadId) {
   if (!result || typeof result !== "object" || Array.isArray(result)) {
     throw new Error("App Server returned an invalid thread response");
   }
-  const threadId = typeof result.threadId === "string" ? result.threadId.trim() : "";
+  // The real App Server wraps the thread as `result.thread = { id, turns }`.
+  // Support a narrow compatibility shape (`result.threadId` + `result.turns`)
+  // for older fixtures, but prefer the real `result.thread` wrapper. Never
+  // returns raw turns or unknown payloads.
+  const threadWrapper = result.thread && typeof result.thread === "object" && !Array.isArray(result.thread)
+    ? result.thread
+    : null;
+  const threadId = threadWrapper && typeof threadWrapper.id === "string"
+    ? threadWrapper.id.trim()
+    : (typeof result.threadId === "string" ? result.threadId.trim() : "");
   if (!threadId || threadId.length > 256 || threadId.includes("\0")) {
     throw new Error("App Server returned an invalid thread id");
   }
   if (expectedThreadId && threadId !== expectedThreadId) {
     throw new Error("App Server returned a different thread id");
   }
-  const turns = Array.isArray(result.turns) ? result.turns : [];
+  const turns = Array.isArray(threadWrapper?.turns)
+    ? threadWrapper.turns
+    : (Array.isArray(result.turns) ? result.turns : []);
   const events = [];
   let sourceOrder = 0;
   for (const turn of turns) {
@@ -237,7 +248,7 @@ export function readCodexThread({
         cwd: workspacePath,
         env: processEnv,
         stdio: ["pipe", "pipe", "ignore"],
-        ...codexSpawnOptions(codexExecutable),
+        ...codexSpawnOptions(invocation.executable),
       });
     } catch (error) {
       reject(spawnError(error));

@@ -123,7 +123,7 @@ function listSkills(codexExecutable, workspacePath, processEnv) {
       cwd: workspacePath,
       env: processEnv,
       stdio: ["pipe", "pipe", "ignore"],
-      ...codexSpawnOptions(codexExecutable),
+      ...codexSpawnOptions(invocation.executable),
     });
     let buffer = "";
     let settled = false;
@@ -249,7 +249,7 @@ export async function discoverAiCatalog({
       timeout: CATALOG_TIMEOUT_MS,
       maxBuffer: CATALOG_MAX_BUFFER,
       windowsHide: true,
-      shell: codexSpawnOptions(codexExecutable).shell,
+      shell: codexSpawnOptions(modelInvocation.executable).shell,
     }),
     listSkills(codexExecutable, workspacePath, processEnv),
   ]);
